@@ -107,7 +107,7 @@ func (s *session) serve() {
 	// Get remote end info for the Received header.
 	s.remoteIP, _, _ = net.SplitHostPort(s.conn.RemoteAddr().String())
 	names, _ := net.LookupAddr(s.remoteIP)
-	if names[0] != "" {
+	if len(names) > 0 {
 		s.remoteHost = names[0]
 	}
 
