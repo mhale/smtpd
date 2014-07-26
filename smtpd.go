@@ -99,7 +99,7 @@ func (srv *Server) newSession(conn net.Conn) (s *session, err error) {
 
 // Function called to handle connection requests.
 func (s *session) serve() {
-	defer s.conn.Close() 
+	defer s.conn.Close()
 	var from string
 	var to []string
 	var buffer bytes.Buffer
