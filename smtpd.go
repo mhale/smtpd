@@ -14,8 +14,8 @@ import (
 )
 
 var (
-	rcptToRE    = regexp.MustCompile(`[Tt][Oo]:<(.+)>`)
-	mailFromRE  = regexp.MustCompile(`[Ff][Rr][Oo][Mm]:<(.*)>`) // Delivery Status Notifications are sent with "MAIL FROM:<>"
+	rcptToRE   = regexp.MustCompile(`[Tt][Oo]:<(.+)>`)
+	mailFromRE = regexp.MustCompile(`[Ff][Rr][Oo][Mm]:<(.*)>`) // Delivery Status Notifications are sent with "MAIL FROM:<>"
 )
 
 // Definition of handler function.
@@ -31,9 +31,9 @@ func ListenAndServe(addr string, handler Handler, appname string, hostname strin
 
 // Server is an SMTP server.
 type Server struct {
-	Addr    string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
-	Handler Handler
-	Appname string
+	Addr     string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
+	Handler  Handler
+	Appname  string
 	Hostname string
 }
 
