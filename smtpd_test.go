@@ -5,12 +5,16 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 )
 
 // Create test server to run commands against.
+// Sleep to give ListenAndServe time to finishing listening before creating clients.
+// This seems to only be necessary since Go 1.5.
 func init() {
 	server := &Server{Addr: "127.0.0.1:52525", Handler: nil}
 	go server.ListenAndServe()
+	time.Sleep(1 * time.Millisecond)
 }
 
 // Create a client to run commands with. Parse the banner for 220 response.
