@@ -233,7 +233,7 @@ func (s *session) readLine() (string, error) {
 func (s *session) parseLine(line string) (verb string, args string) {
 	if idx := strings.Index(line, " "); idx != -1 {
 		verb = strings.ToUpper(line[:idx])
-		args = strings.TrimSpace(line[idx+1 : len(line)])
+		args = strings.TrimSpace(line[idx+1:])
 	} else {
 		verb = strings.ToUpper(line)
 		args = ""
