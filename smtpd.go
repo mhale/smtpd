@@ -1,4 +1,4 @@
-// SMTP server package.
+// Package smtpd implements a basic SMTP server.
 package smtpd
 
 import (
@@ -18,7 +18,7 @@ var (
 	mailFromRE = regexp.MustCompile(`[Ff][Rr][Oo][Mm]:<(.*)>`) // Delivery Status Notifications are sent with "MAIL FROM:<>"
 )
 
-// Definition of handler function.
+// Handler function called upon successful receipt of an email.
 type Handler func(remoteAddr net.Addr, from string, to []string, data []byte)
 
 // ListenAndServe listens on the TCP network address addr
@@ -57,6 +57,7 @@ func (srv *Server) ListenAndServe() error {
 	return srv.Serve(ln)
 }
 
+// Serve creates a new SMTP session after a network connection is established.
 func (srv *Server) Serve(ln net.Listener) error {
 	defer ln.Close()
 	for {
