@@ -286,3 +286,33 @@ func TestReadData(t *testing.T) {
 		}
 	}
 }
+
+// Benchmark the mail handling without the network stack introducing latency.
+func BenchmarkReceive(b *testing.B) {
+	clientConn, serverConn := net.Pipe()
+
+	server := &Server{}
+	session, _ := server.newSession(serverConn)
+	go session.serve()
+
+	reader := bufio.NewReader(clientConn)
+	_, _ = reader.ReadString('\n') // Read greeting message first.
+
+	b.ResetTimer()
+
+	// Benchmark a full mail transaction.
+	for i := 0; i < b.N; i++ {
+		fmt.Fprintf(clientConn, "%s\r\n", "EHLO host.example.com")
+		_, _ = reader.ReadString('\n')
+		fmt.Fprintf(clientConn, "%s\r\n", "MAIL FROM:<sender@example.com>")
+		_, _ = reader.ReadString('\n')
+		fmt.Fprintf(clientConn, "%s\r\n", "RCPT TO:<recipient@example.com>")
+		_, _ = reader.ReadString('\n')
+		fmt.Fprintf(clientConn, "%s\r\n", "DATA")
+		_, _ = reader.ReadString('\n')
+		fmt.Fprintf(clientConn, "%s\r\n", "Test message.\r\n.")
+		_, _ = reader.ReadString('\n')
+		fmt.Fprintf(clientConn, "%s\r\n", "QUIT")
+		_, _ = reader.ReadString('\n')
+	}
+}
