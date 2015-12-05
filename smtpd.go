@@ -246,19 +246,20 @@ func (s *session) parseLine(line string) (verb string, args string) {
 func (s *session) readData() ([]byte, error) {
 	var data []byte
 	for {
-		slice, err := s.br.ReadSlice('\n')
+		line, err := s.br.ReadBytes('\n')
 		if err != nil {
 			return nil, err
 		}
 		// Handle end of data denoted by lone period (\r\n.\r\n)
-		if bytes.Equal(slice, []byte(".\r\n")) {
+		if bytes.Equal(line, []byte(".\r\n")) {
 			break
 		}
 		// Remove leading period (RFC 5321 section 4.5.2)
-		if slice[0] == '.' {
-			slice = slice[1:]
+		if line[0] == '.' {
+			line = line[1:]
 		}
-		data = append(data, slice...)
+		data = append(data, line...)
+
 	}
 	return data, nil
 }
