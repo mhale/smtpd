@@ -5,7 +5,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"regexp"
@@ -64,7 +63,6 @@ func (srv *Server) Serve(ln net.Listener) error {
 		conn, err := ln.Accept()
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
-				log.Printf("%s: Accept error: %v", srv.Appname, err)
 				continue
 			}
 			return err
