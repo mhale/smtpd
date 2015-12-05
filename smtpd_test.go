@@ -2,7 +2,9 @@ package smtpd
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -116,7 +118,7 @@ func TestCmdMAIL(t *testing.T) {
 	cmdCode(t, conn, "MAIL FROM:", "501")
 	// MAIL with DSN-style FROM arg should return 250 Ok
 	cmdCode(t, conn, "MAIL FROM:<>", "250")
-	// MAIL with good FROM arg should return 250 Ok
+	// MAIL with valid FROM arg should return 250 Ok
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
 
 	cmdCode(t, conn, "QUIT", "221")
@@ -127,23 +129,27 @@ func TestCmdRCPT(t *testing.T) {
 	conn := newConn(t)
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
-	// RCPT without preceeding MAIL should return 503 bad sequence
+	// RCPT without prior MAIL should return 503 bad sequence
 	cmdCode(t, conn, "RCPT", "503")
 
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
 
 	// RCPT with no TO arg should return 501 syntax error
 	cmdCode(t, conn, "RCPT", "501")
+
 	// RCPT with empty TO arg should return 501 syntax error
 	cmdCode(t, conn, "RCPT TO:", "501")
-	// RCPT with good TO arg should return 250 Ok
+
+	// RCPT with valid TO arg should return 250 Ok
 	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
 
-	// Multiple recipients with good TO arg should return 250 Ok
-	cmdCode(t, conn, "RCPT TO:<recipient2@example.com>", "250")
-	cmdCode(t, conn, "RCPT TO:<recipient3@example.com>", "250")
-	cmdCode(t, conn, "RCPT TO:<recipient4@example.com>", "250")
-	cmdCode(t, conn, "RCPT TO:<recipient5@example.com>", "250")
+	// Up to 100 valid recipients should return 250 Ok
+	for i := 2; i < 101; i++ {
+		cmdCode(t, conn, fmt.Sprintf("RCPT TO:<recipient%v@example.com>", i), "250")
+	}
+
+	// 101st valid recipient with valid TO arg should return 452 too many recipients
+	cmdCode(t, conn, "RCPT TO:<recipient101@example.com>", "452")
 
 	cmdCode(t, conn, "QUIT", "221")
 	conn.Close()
@@ -153,8 +159,14 @@ func TestCmdDATA(t *testing.T) {
 	conn := newConn(t)
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
-	// DATA without preceeding MAIL & RCPT should return 503 bad sequence
+	// DATA without prior MAIL & RCPT should return 503 bad sequence
 	cmdCode(t, conn, "DATA", "503")
+	cmdCode(t, conn, "RSET", "250")
+
+	// DATA without prior RCPT should return 503 bad sequence
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "DATA", "503")
+	cmdCode(t, conn, "RSET", "250")
 
 	// Test a full mail transaction.
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
@@ -162,10 +174,33 @@ func TestCmdDATA(t *testing.T) {
 	cmdCode(t, conn, "DATA", "354")
 	cmdCode(t, conn, "Test message.\r\n.", "250")
 
+	// Test a full mail transaction with a bad last recipient.
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, conn, "RCPT TO:", "501")
+	cmdCode(t, conn, "DATA", "354")
+	cmdCode(t, conn, "Test message.\r\n.", "250")
+
 	cmdCode(t, conn, "QUIT", "221")
 	conn.Close()
 }
 
+func TestMakeHeaders(t *testing.T) {
+	now := time.Now().Format("Mon, _2 Jan 2006 15:04:05 -0700 (MST)")
+	valid := "Received: from clientName (clientHost [clientIP])\r\n" +
+		"        by serverName (smtpd) with SMTP\r\n" +
+		"        for <recipient@example.com>; " +
+		fmt.Sprintf("%s\r\n", now)
+
+	srv := &Server{"", nil, "smtpd", "serverName"}
+	s := &session{srv, nil, nil, nil, "clientIP", "clientHost", "clientName"}
+	headers := s.makeHeaders([]string{"recipient@example.com"})
+	if string(headers) != valid {
+		t.Errorf("makeHeaders() returned\n%v, want\n%v", string(headers), valid)
+	}
+}
+
+// Test parsing of commands into verbs and arguments.
 func TestParseLine(t *testing.T) {
 	tests := []struct {
 		line string
@@ -182,6 +217,72 @@ func TestParseLine(t *testing.T) {
 		verb, args := s.parseLine(tt.line)
 		if verb != tt.verb || args != tt.args {
 			t.Errorf("ParseLine(%v) returned %v, %v, want %v, %v", tt.line, verb, args, tt.verb, tt.args)
+		}
+	}
+}
+
+// Test reading of complete lines from the socket.
+func TestReadLine(t *testing.T) {
+	var buf bytes.Buffer
+	s := &session{}
+	s.br = bufio.NewReader(&buf)
+
+	// Ensure readLine() returns an EOF error on an empty buffer.
+	_, err := s.readLine()
+	if err != io.EOF {
+		t.Errorf("readLine() on empty buffer returned err: %v, want EOF", err)
+	}
+
+	// Ensure trailing <CRLF> is stripped.
+	line := "FOO BAR BAZ\r\n"
+	cmd := "FOO BAR BAZ"
+	buf.Write([]byte(line))
+	output, err := s.readLine()
+	if err != nil {
+		t.Errorf("readLine(%v) returned err: %v", line, err)
+	} else if output != cmd {
+		t.Errorf("readLine(%v) returned %v, want %v", line, output, cmd)
+	}
+}
+
+// Test reading of message data, including dot stuffing (see RFC 5321 section 4.5.2).
+func TestReadData(t *testing.T) {
+	tests := []struct {
+		lines string
+		data  string
+	}{
+		// Single line message.
+		{"Test message.\r\n.\r\n", "Test message.\r\n"},
+
+		// Single line message with leading period removed.
+		{".Test message.\r\n.\r\n", "Test message.\r\n"},
+
+		// Multiple line message.
+		{"Line 1.\r\nLine 2.\r\nLine 3.\r\n.\r\n", "Line 1.\r\nLine 2.\r\nLine 3.\r\n"},
+
+		// Multiple line message with leading period removed.
+		{"Line 1.\r\n.Line 2.\r\nLine 3.\r\n.\r\n", "Line 1.\r\nLine 2.\r\nLine 3.\r\n"},
+
+		// Multiple line message with one leading period removed.
+		{"Line 1.\r\n..Line 2.\r\nLine 3.\r\n.\r\n", "Line 1.\r\n.Line 2.\r\nLine 3.\r\n"},
+	}
+	var buf bytes.Buffer
+	s := &session{}
+	s.br = bufio.NewReader(&buf)
+
+	// Ensure readData() returns an EOF error on an empty buffer.
+	_, err := s.readData()
+	if err != io.EOF {
+		t.Errorf("readData() on empty buffer returned err: %v, want EOF", err)
+	}
+
+	for _, tt := range tests {
+		buf.Write([]byte(tt.lines))
+		data, err := s.readData()
+		if err != nil {
+			t.Errorf("readData(%v) returned err: %v", tt.lines, err)
+		} else if string(data) != tt.data {
+			t.Errorf("readData(%v) returned %v, want %v", tt.lines, string(data), tt.data)
 		}
 	}
 }
