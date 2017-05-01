@@ -226,9 +226,14 @@ loop:
 }
 
 // Wrapper function for writing a complete line to the socket.
-func (s *session) writef(format string, args ...interface{}) {
+func (s *session) writef(format string, args ...interface{}) error {
+	if s.srv.Timeout > 0 {
+		s.conn.SetWriteDeadline(time.Now().Add(s.srv.Timeout))
+	}
+
 	fmt.Fprintf(s.bw, format+"\r\n", args...)
-	s.bw.Flush()
+	err := s.bw.Flush()
+	return err
 }
 
 // Read a complete line from the socket.
