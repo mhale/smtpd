@@ -34,6 +34,7 @@ type Server struct {
 	Handler  Handler
 	Appname  string
 	Hostname string
+	Timeout  time.Duration
 }
 
 // ListenAndServe listens on the TCP network address srv.Addr and then
@@ -49,6 +50,10 @@ func (srv *Server) ListenAndServe() error {
 	if srv.Hostname == "" {
 		srv.Hostname, _ = os.Hostname()
 	}
+	if srv.Timeout == 0 {
+		srv.Timeout = 5 * time.Minute
+	}
+
 	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
 		return err
@@ -118,9 +123,13 @@ func (s *session) serve() {
 loop:
 	for {
 		// Attempt to read a line from the socket.
+		// On timeout, send a timeout message and return from serve().
 		// On error, assume the client has gone away i.e. return from serve().
 		line, err := s.readLine()
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				s.writef("421 4.4.2 %s %s SMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
+			}
 			break
 		}
 		verb, args := s.parseLine(line)
@@ -171,9 +180,13 @@ loop:
 			s.writef("354 Start mail input; end with <CR><LF>.<CR><LF>")
 
 			// Attempt to read message body from the socket.
+			// On timeout, send a timeout message and return from serve().
 			// On error, assume the client has gone away i.e. return from serve().
 			data, err := s.readData()
 			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					s.writef("421 4.4.2 %s %s SMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
+				}
 				break loop
 			}
 
@@ -220,6 +233,10 @@ func (s *session) writef(format string, args ...interface{}) {
 
 // Read a complete line from the socket.
 func (s *session) readLine() (string, error) {
+	if s.srv.Timeout > 0 {
+		s.conn.SetReadDeadline(time.Now().Add(s.srv.Timeout))
+	}
+
 	line, err := s.br.ReadString('\n')
 	if err != nil {
 		return "", err
@@ -244,6 +261,10 @@ func (s *session) parseLine(line string) (verb string, args string) {
 func (s *session) readData() ([]byte, error) {
 	var data []byte
 	for {
+		if s.srv.Timeout > 0 {
+			s.conn.SetReadDeadline(time.Now().Add(s.srv.Timeout))
+		}
+
 		line, err := s.br.ReadBytes('\n')
 		if err != nil {
 			return nil, err

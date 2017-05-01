@@ -192,7 +192,7 @@ func TestMakeHeaders(t *testing.T) {
 		"        for <recipient@example.com>; " +
 		fmt.Sprintf("%s\r\n", now)
 
-	srv := &Server{"", nil, "smtpd", "serverName"}
+	srv := &Server{"", nil, "smtpd", "serverName", 0}
 	s := &session{srv, nil, nil, nil, "clientIP", "clientHost", "clientName"}
 	headers := s.makeHeaders([]string{"recipient@example.com"})
 	if string(headers) != valid {
@@ -225,6 +225,7 @@ func TestParseLine(t *testing.T) {
 func TestReadLine(t *testing.T) {
 	var buf bytes.Buffer
 	s := &session{}
+	s.srv = &Server{}
 	s.br = bufio.NewReader(&buf)
 
 	// Ensure readLine() returns an EOF error on an empty buffer.
@@ -268,6 +269,7 @@ func TestReadData(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	s := &session{}
+	s.srv = &Server{}
 	s.br = bufio.NewReader(&buf)
 
 	// Ensure readData() returns an EOF error on an empty buffer.
