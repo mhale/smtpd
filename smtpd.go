@@ -118,7 +118,7 @@ func (s *session) serve() {
 	}
 
 	// Send banner.
-	s.writef("220 %s %s SMTP Service ready", s.srv.Hostname, s.srv.Appname)
+	s.writef("220 %s %s ESMTP Service ready", s.srv.Hostname, s.srv.Appname)
 
 loop:
 	for {
@@ -128,16 +128,27 @@ loop:
 		line, err := s.readLine()
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				s.writef("421 4.4.2 %s %s SMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
+				s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
 			}
 			break
 		}
 		verb, args := s.parseLine(line)
 
 		switch verb {
-		case "EHLO", "HELO":
+		case "HELO":
 			s.remoteName = args
 			s.writef("250 %s greets %s", s.srv.Hostname, s.remoteName)
+
+			// RFC 2821 section 4.1.4 specifies that EHLO has the same effect as RSET.
+			from = ""
+			to = nil
+			buffer.Reset()
+		case "EHLO":
+			s.remoteName = args
+
+			greeting := fmt.Sprintf("250-%s greets %s\r\n", s.srv.Hostname, s.remoteName)
+			greeting += "250 ENHANCEDSTATUSCODES"
+			s.writef(greeting)
 
 			// RFC 2821 section 4.1.4 specifies that EHLO has the same effect as RSET.
 			from = ""
@@ -146,34 +157,34 @@ loop:
 		case "MAIL":
 			match := mailFromRE.FindStringSubmatch(args)
 			if match == nil {
-				s.writef("501 Syntax error in parameters or arguments (invalid FROM parameter)")
+				s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid FROM parameter)")
 			} else {
 				from = match[1]
-				s.writef("250 Ok")
+				s.writef("250 2.1.0 Ok")
 			}
 			to = nil
 			buffer.Reset()
 		case "RCPT":
 			if from == "" {
-				s.writef("503 Bad sequence of commands (MAIL required before RCPT)")
+				s.writef("503 5.5.1 Bad sequence of commands (MAIL required before RCPT)")
 				break
 			}
 
 			match := rcptToRE.FindStringSubmatch(args)
 			if match == nil {
-				s.writef("501 Syntax error in parameters or arguments (invalid TO parameter)")
+				s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid TO parameter)")
 			} else {
 				// RFC 5321 specifies 100 minimum recipients
 				if len(to) == 100 {
-					s.writef("452 Too many recipients")
+					s.writef("452 4.5.3 Too many recipients")
 				} else {
 					to = append(to, match[1])
-					s.writef("250 Ok")
+					s.writef("250 2.1.5 Ok")
 				}
 			}
 		case "DATA":
 			if from == "" || to == nil {
-				s.writef("503 Bad sequence of commands (MAIL & RCPT required before DATA)")
+				s.writef("503 5.5.1 Bad sequence of commands (MAIL & RCPT required before DATA)")
 				break
 			}
 
@@ -185,7 +196,7 @@ loop:
 			data, err := s.readData()
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					s.writef("421 4.4.2 %s %s SMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
+					s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
 				}
 				break loop
 			}
@@ -194,7 +205,7 @@ loop:
 			buffer.Reset()
 			buffer.Write(s.makeHeaders(to))
 			buffer.Write(data)
-			s.writef("250 Ok: queued")
+			s.writef("250 2.0.0 Ok: queued")
 
 			// Pass mail on to handler.
 			if s.srv.Handler != nil {
@@ -206,21 +217,21 @@ loop:
 			to = nil
 			buffer.Reset()
 		case "QUIT":
-			s.writef("221 %s %s SMTP Service closing transmission channel", s.srv.Hostname, s.srv.Appname)
+			s.writef("221 2.0.0 %s %s ESMTP Service closing transmission channel", s.srv.Hostname, s.srv.Appname)
 			break loop
 		case "RSET":
-			s.writef("250 Ok")
+			s.writef("250 2.0.0 Ok")
 			from = ""
 			to = nil
 			buffer.Reset()
 		case "NOOP":
-			s.writef("250 Ok")
+			s.writef("250 2.0.0 Ok")
 		case "HELP", "VRFY", "EXPN":
 			// See RFC 5321 section 4.2.4 for usage of 500 & 502 reply codes
-			s.writef("502 Command not implemented")
+			s.writef("502 5.5.1 Command not implemented")
 		default:
 			// See RFC 5321 section 4.2.4 for usage of 500 & 502 reply codes
-			s.writef("500 Syntax error, command unrecognized")
+			s.writef("500 5.5.2 Syntax error, command unrecognized")
 		}
 	}
 }

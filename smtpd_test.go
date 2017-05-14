@@ -304,7 +304,7 @@ func BenchmarkReceive(b *testing.B) {
 
 	// Benchmark a full mail transaction.
 	for i := 0; i < b.N; i++ {
-		fmt.Fprintf(clientConn, "%s\r\n", "EHLO host.example.com")
+		fmt.Fprintf(clientConn, "%s\r\n", "HELO host.example.com")
 		_, _ = reader.ReadString('\n')
 		fmt.Fprintf(clientConn, "%s\r\n", "MAIL FROM:<sender@example.com>")
 		_, _ = reader.ReadString('\n')
