@@ -72,10 +72,7 @@ func (srv *Server) Serve(ln net.Listener) error {
 			}
 			return err
 		}
-		session, err := srv.newSession(conn)
-		if err != nil {
-			continue
-		}
+		session := srv.newSession(conn)
 		go session.serve()
 	}
 }
@@ -91,7 +88,7 @@ type session struct {
 }
 
 // Create new session from connection.
-func (srv *Server) newSession(conn net.Conn) (s *session, err error) {
+func (srv *Server) newSession(conn net.Conn) (s *session) {
 	s = &session{
 		srv:  srv,
 		conn: conn,

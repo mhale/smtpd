@@ -294,7 +294,7 @@ func BenchmarkReceive(b *testing.B) {
 	clientConn, serverConn := net.Pipe()
 
 	server := &Server{}
-	session, _ := server.newSession(serverConn)
+	session := server.newSession(serverConn)
 	go session.serve()
 
 	reader := bufio.NewReader(clientConn)
