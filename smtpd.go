@@ -4,7 +4,9 @@ package smtpd
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"regexp"
@@ -13,8 +15,12 @@ import (
 )
 
 var (
+	Debug      = false
 	rcptToRE   = regexp.MustCompile(`[Tt][Oo]:<(.+)>`)
 	mailFromRE = regexp.MustCompile(`[Ff][Rr][Oo][Mm]:<(.*)>`) // Delivery Status Notifications are sent with "MAIL FROM:<>"
+
+	// Commands allowed when TLS is required but not in use as per RFC 3207. Any other command gets a 530 response.
+	allowedCmds = map[string]bool{"NOOP": true, "EHLO": true, "STARTTLS": true, "QUIT": true}
 )
 
 // Handler function called upon successful receipt of an email.
@@ -28,13 +34,38 @@ func ListenAndServe(addr string, handler Handler, appname string, hostname strin
 	return srv.ListenAndServe()
 }
 
+// ListenAndServeTLS listens on the TCP network address addr
+// and then calls Serve with handler to handle requests
+// on incoming connections. Connections may be upgraded to TLS if the client requests it.
+func ListenAndServeTLS(addr string, certFile string, keyFile string, handler Handler, appname string, hostname string) error {
+	srv := &Server{Addr: addr, Handler: handler, Appname: appname, Hostname: hostname}
+	err := srv.ConfigureTLS(certFile, keyFile)
+	if err != nil {
+		return err
+	}
+	return srv.ListenAndServe()
+}
+
 // Server is an SMTP server.
 type Server struct {
-	Addr     string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
-	Handler  Handler
-	Appname  string
-	Hostname string
-	Timeout  time.Duration
+	Addr        string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
+	Handler     Handler
+	Appname     string
+	Hostname    string
+	Timeout     time.Duration
+	TLSConfig   *tls.Config
+	TLSRequired bool // Require TLS for every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207. Ignored if TLS is not configured.
+	TLSListener bool // Listen for incoming TLS connections only (not recommended as it may reduce compatibility). Ignored if TLS is not configured.
+}
+
+// ConfigureTLS creates a TLS configuration from certificate and key files.
+func (srv *Server) ConfigureTLS(certFile string, keyFile string) error {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return err
+	}
+	srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+	return nil
 }
 
 // ListenAndServe listens on the TCP network address srv.Addr and then
@@ -54,7 +85,15 @@ func (srv *Server) ListenAndServe() error {
 		srv.Timeout = 5 * time.Minute
 	}
 
-	ln, err := net.Listen("tcp", srv.Addr)
+	var ln net.Listener
+	var err error
+
+	// If TLSListener is enabled, listen for TLS connections only.
+	if srv.TLSConfig != nil && srv.TLSListener == true {
+		ln, err = tls.Listen("tcp", srv.Addr, srv.TLSConfig)
+	} else {
+		ln, err = net.Listen("tcp", srv.Addr)
+	}
 	if err != nil {
 		return err
 	}
@@ -85,6 +124,7 @@ type session struct {
 	remoteIP   string // Remote IP address
 	remoteHost string // Remote hostname according to reverse DNS lookup
 	remoteName string // Remote hostname as supplied with EHLO
+	tls        bool
 }
 
 // Create new session from connection.
@@ -95,15 +135,6 @@ func (srv *Server) newSession(conn net.Conn) (s *session) {
 		br:   bufio.NewReader(conn),
 		bw:   bufio.NewWriter(conn),
 	}
-	return
-}
-
-// Function called to handle connection requests.
-func (s *session) serve() {
-	defer s.conn.Close()
-	var from string
-	var to []string
-	var buffer bytes.Buffer
 
 	// Get remote end info for the Received header.
 	s.remoteIP, _, _ = net.SplitHostPort(s.conn.RemoteAddr().String())
@@ -113,6 +144,19 @@ func (s *session) serve() {
 	} else {
 		s.remoteHost = "unknown"
 	}
+
+	// Set tls = true if TLS is already in use.
+	_, s.tls = s.conn.(*tls.Conn)
+
+	return
+}
+
+// Function called to handle connection requests.
+func (s *session) serve() {
+	defer s.conn.Close()
+	var from string
+	var to []string
+	var buffer bytes.Buffer
 
 	// Send banner.
 	s.writef("220 %s %s ESMTP Service ready", s.srv.Hostname, s.srv.Appname)
@@ -131,21 +175,26 @@ loop:
 		}
 		verb, args := s.parseLine(line)
 
+		// If TLS is configured and required, but not already in use, reject every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207.
+		if s.srv.TLSConfig != nil && s.srv.TLSRequired == true && s.tls == false {
+			if _, ok := allowedCmds[verb]; !ok {
+				s.writef("530 5.7.0 Must issue a STARTTLS command first")
+				continue
+			}
+		}
+
 		switch verb {
 		case "HELO":
 			s.remoteName = args
 			s.writef("250 %s greets %s", s.srv.Hostname, s.remoteName)
 
-			// RFC 2821 section 4.1.4 specifies that EHLO has the same effect as RSET.
+			// RFC 2821 section 4.1.4 specifies that EHLO has the same effect as RSET, so reset for HELO too.
 			from = ""
 			to = nil
 			buffer.Reset()
 		case "EHLO":
 			s.remoteName = args
-
-			greeting := fmt.Sprintf("250-%s greets %s\r\n", s.srv.Hostname, s.remoteName)
-			greeting += "250 ENHANCEDSTATUSCODES"
-			s.writef(greeting)
+			s.writef(s.makeEHLOResponse())
 
 			// RFC 2821 section 4.1.4 specifies that EHLO has the same effect as RSET.
 			from = ""
@@ -226,6 +275,40 @@ loop:
 		case "HELP", "VRFY", "EXPN":
 			// See RFC 5321 section 4.2.4 for usage of 500 & 502 reply codes
 			s.writef("502 5.5.1 Command not implemented")
+		case "STARTTLS":
+			// Handle case where TLS is requested but not configured (and therefore not listed as a service extension).
+			if s.srv.TLSConfig == nil {
+				s.writef("502 5.5.1 Command not implemented")
+				break
+			}
+
+			// Handle case where STARTTLS is called more than once (in violation of RFC 3207).
+			if s.tls == true {
+				s.writef("503 5.5.1 Bad sequence of commands (TLS already in use)")
+				break
+			}
+
+			s.writef("220 2.0.0 Ready to start TLS")
+
+			// Establish a TLS connection with the client.
+			tlsConn := tls.Server(s.conn, s.srv.TLSConfig)
+			err := tlsConn.Handshake()
+			if err != nil {
+				s.writef("403 4.7.0 TLS handshake failed")
+				break
+			}
+
+			// TLS handshake succeeded, switch to using the TLS connection.
+			s.conn = tlsConn
+			s.br = bufio.NewReader(s.conn)
+			s.bw = bufio.NewWriter(s.conn)
+			s.tls = true
+
+			// RFC 3207 states the server must discard any prior knowledge obtained from the client.
+			s.remoteName = ""
+			from = ""
+			to = nil
+			buffer.Reset()
 		default:
 			// See RFC 5321 section 4.2.4 for usage of 500 & 502 reply codes
 			s.writef("500 5.5.2 Syntax error, command unrecognized")
@@ -241,6 +324,11 @@ func (s *session) writef(format string, args ...interface{}) error {
 
 	fmt.Fprintf(s.bw, format+"\r\n", args...)
 	err := s.bw.Flush()
+
+	if Debug {
+		log.Println(s.remoteIP, "WROTE", fmt.Sprintf(format, args...))
+	}
+
 	return err
 }
 
@@ -255,6 +343,11 @@ func (s *session) readLine() (string, error) {
 		return "", err
 	}
 	line = strings.TrimSpace(line) // Strip trailing \r\n
+
+	if Debug {
+		log.Println(s.remoteIP, "READ ", line)
+	}
+
 	return line, err
 }
 
@@ -305,4 +398,17 @@ func (s *session) makeHeaders(to []string) []byte {
 	buffer.WriteString(fmt.Sprintf("        by %s (%s) with SMTP\r\n", s.srv.Hostname, s.srv.Appname))
 	buffer.WriteString(fmt.Sprintf("        for <%s>; %s\r\n", to[0], now))
 	return buffer.Bytes()
+}
+
+// Create the greeting string sent in response to an EHLO command.
+func (s *session) makeEHLOResponse() (response string) {
+	response = fmt.Sprintf("250-%s greets %s\r\n", s.srv.Hostname, s.remoteName)
+
+	// Only list STARTTLS if TLS is configured, but not currently in use.
+	if s.srv.TLSConfig != nil && s.tls == false {
+		response += "250-STARTTLS\r\n"
+	}
+
+	response += "250 ENHANCEDSTATUSCODES"
+	return
 }
