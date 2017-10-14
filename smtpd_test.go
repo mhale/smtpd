@@ -166,6 +166,11 @@ func TestCmdRCPT(t *testing.T) {
 	// 101st valid recipient with valid TO arg should return 452 too many recipients
 	cmdCode(t, conn, "RCPT TO:<recipient101@example.com>", "452")
 
+	// RCPT with valid TO arg and prior DSN-style FROM arg should return 250 Ok
+	cmdCode(t, conn, "RSET", "250")
+	cmdCode(t, conn, "MAIL FROM:<>", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+
 	cmdCode(t, conn, "QUIT", "221")
 	conn.Close()
 }
