@@ -26,6 +26,9 @@ var (
 // Handler function called upon successful receipt of an email.
 type Handler func(remoteAddr net.Addr, from string, to []string, data []byte)
 
+// Handler function called on RCPT. Return acccept status
+type HandlerRcpt func(remoteAddr net.Addr, from string, to string) bool
+
 // ListenAndServe listens on the TCP network address addr
 // and then calls Serve with handler to handle requests
 // on incoming connections.
@@ -50,6 +53,7 @@ func ListenAndServeTLS(addr string, certFile string, keyFile string, handler Han
 type Server struct {
 	Addr        string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
 	Handler     Handler
+	HandlerRcpt HandlerRcpt
 	Appname     string
 	Hostname    string
 	Timeout     time.Duration
@@ -228,8 +232,16 @@ loop:
 				if len(to) == 100 {
 					s.writef("452 4.5.3 Too many recipients")
 				} else {
-					to = append(to, match[1])
-					s.writef("250 2.1.5 Ok")
+					accept := true
+					if s.srv.HandlerRcpt != nil {
+						accept = s.srv.HandlerRcpt(s.conn.RemoteAddr(), from, match[1])
+					}
+					if accept {
+						to = append(to, match[1])
+						s.writef("250 2.1.5 Ok")
+					} else {
+						s.writef("550 Mailbox unavailable")
+					}
 				}
 			}
 		case "DATA":
