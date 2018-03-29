@@ -9,6 +9,7 @@ It is based on [Brad Fitzpatrick's go-smtpd](https://github.com/bradfitz/go-smtp
 * Testing has been added
 * Code refactoring
 * TLS support
+* RCPT handler
 
 ## Features
 
@@ -115,6 +116,28 @@ func main() {
 This allows STARTTLS to be listed as a supported extension and allows clients to upgrade connections to TLS by sending a STARTTLS command.
 
 As the package level helper functions do not set the TLSRequired or TLSListener options for compatibility reasons, manual creation of a Server struct is necessary in order to use them.
+
+## RCPT handler example
+With the same ```mailHandler``` as above:
+```go
+func rcptHandler(remoteAddr net.Addr, from string, to string) bool {
+	domain = getDomain(to)
+	return domain == "mail.example.com"
+}
+
+func ListenAndServe(addr string, handler smtpd.Handler, rcpt smtpd.HandlerRcpt) error {
+	srv := &smtpd.Server{
+		Addr:        addr,
+		Handler:     handler,
+		HandlerRcpt: rcpt,
+		Appname:     "MyServerApp",
+		Hostname:    "",
+	}
+	return srv.ListenAndServe()
+}
+
+ListenAndServe("127.0.0.1:2525", mailHandler, rcptHandler)
+```
 
 ## Testing
 
