@@ -26,7 +26,7 @@ var (
 // Handler function called upon successful receipt of an email.
 type Handler func(remoteAddr net.Addr, from string, to []string, data []byte)
 
-// Handler function called on RCPT. Return acccept status
+// HandlerRcpt function called on RCPT. Return acccept status
 type HandlerRcpt func(remoteAddr net.Addr, from string, to string) bool
 
 // ListenAndServe listens on the TCP network address addr
@@ -49,6 +49,18 @@ func ListenAndServeTLS(addr string, certFile string, keyFile string, handler Han
 	return srv.ListenAndServe()
 }
 
+type maxSizeExceededError struct {
+	limit int
+}
+
+func maxSizeExceeded(limit int) maxSizeExceededError {
+	return maxSizeExceededError{limit}
+}
+
+func (err maxSizeExceededError) Error() string {
+	return fmt.Sprintf("552  Exceeded storage allocation (%d)", err.limit)
+}
+
 // Server is an SMTP server.
 type Server struct {
 	Addr        string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
@@ -57,6 +69,7 @@ type Server struct {
 	Appname     string
 	Hostname    string
 	Timeout     time.Duration
+	MaxSize     int
 	TLSConfig   *tls.Config
 	TLSRequired bool // Require TLS for every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207. Ignored if TLS is not configured.
 	TLSListener bool // Listen for incoming TLS connections only (not recommended as it may reduce compatibility). Ignored if TLS is not configured.
@@ -257,8 +270,15 @@ loop:
 			// On error, assume the client has gone away i.e. return from serve().
 			data, err := s.readData()
 			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
+				switch err.(type) {
+				case net.Error:
+					if err.(net.Error).Timeout() {
+						s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
+					}
+				case maxSizeExceededError:
+					s.writef(err.Error())
+				default:
+					s.writef("451 Local error in processing")
 				}
 				break loop
 			}
@@ -388,6 +408,11 @@ func (s *session) readData() ([]byte, error) {
 	for {
 		if s.srv.Timeout > 0 {
 			s.conn.SetReadDeadline(time.Now().Add(s.srv.Timeout))
+		}
+		if s.srv.MaxSize > 0 {
+			if len(data) > s.srv.MaxSize {
+				return nil, maxSizeExceeded(s.srv.MaxSize)
+			}
 		}
 
 		line, err := s.br.ReadBytes('\n')
