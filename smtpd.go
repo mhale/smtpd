@@ -71,7 +71,7 @@ type Server struct {
 	Appname     string
 	Hostname    string
 	Timeout     time.Duration
-	MaxSize     int
+	MaxSize     int // Maximum message size allowed, in bytes
 	TLSConfig   *tls.Config
 	TLSRequired bool // Require TLS for every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207. Ignored if TLS is not configured.
 	TLSListener bool // Listen for incoming TLS connections only (not recommended as it may reduce compatibility). Ignored if TLS is not configured.
@@ -277,12 +277,14 @@ loop:
 					if err.(net.Error).Timeout() {
 						s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
 					}
+					break loop
 				case maxSizeExceededError:
 					s.writef(err.Error())
+					continue
 				default:
 					s.writef("451 4.3.0 Requested action aborted: local error in processing")
+					continue
 				}
-				break loop
 			}
 
 			// Create Received header & write message body into buffer.
@@ -411,11 +413,6 @@ func (s *session) readData() ([]byte, error) {
 		if s.srv.Timeout > 0 {
 			s.conn.SetReadDeadline(time.Now().Add(s.srv.Timeout))
 		}
-		if s.srv.MaxSize > 0 {
-			if len(data) > s.srv.MaxSize {
-				return nil, maxSizeExceeded(s.srv.MaxSize)
-			}
-		}
 
 		line, err := s.br.ReadBytes('\n')
 		if err != nil {
@@ -429,8 +426,16 @@ func (s *session) readData() ([]byte, error) {
 		if line[0] == '.' {
 			line = line[1:]
 		}
-		data = append(data, line...)
 
+		// Enforce the maximum message size limit.
+		if s.srv.MaxSize > 0 {
+			if len(data) + len(line) > s.srv.MaxSize {
+				_, _ = s.br.Discard(s.br.Buffered()) // Discard the buffer remnants.
+				return nil, maxSizeExceeded(s.srv.MaxSize)
+			}
+		}
+
+		data = append(data, line...)
 	}
 	return data, nil
 }
