@@ -205,6 +205,51 @@ func TestCmdDATA(t *testing.T) {
 	conn.Close()
 }
 
+func TestCmdDATAWithMaxSize(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+
+	// "Test message.\r\n." is 15 bytes after trailing period is removed.
+	server := &Server{MaxSize: 15}
+	session := server.newSession(serverConn)
+	go session.serve()
+
+	reader := bufio.NewReader(clientConn)
+	_, _ = reader.ReadString('\n') // Read greeting message first.
+
+	cmdCode(t, clientConn, "EHLO host.example.com", "250")
+
+	// Messages below the maximum size should return 250 Ok
+	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, clientConn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, clientConn, "DATA", "354")
+	cmdCode(t, clientConn, "Test message\r\n.", "250")
+
+	// Messages matching the maximum size should return 250 Ok
+	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, clientConn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, clientConn, "DATA", "354")
+	cmdCode(t, clientConn, "Test message.\r\n.", "250")
+
+	// Messages above the maximum size should return a maximum size exceeded error.
+	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, clientConn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, clientConn, "DATA", "354")
+	cmdCode(t, clientConn, "Test message that is too long.\r\n.", "552")
+
+	// Clients should send either RSET or QUIT after receiving 552 (RFC 1870 section 6.2).
+	cmdCode(t, clientConn, "RSET", "250")
+
+	// Messages above the maximum size should return a maximum size exceeded error.
+	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, clientConn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, clientConn, "DATA", "354")
+	cmdCode(t, clientConn, "Test message.\r\nSecond line that is too long.\r\n.", "552")
+
+	// Clients should send either RSET or QUIT after receiving 552 (RFC 1870 section 6.2).
+	cmdCode(t, clientConn, "QUIT", "221")
+	clientConn.Close()
+}
+
 func TestCmdSTARTTLS(t *testing.T) {
 	conn := newConn(t)
 	cmdCode(t, conn, "EHLO host.example.com", "250")
@@ -504,6 +549,39 @@ func TestReadData(t *testing.T) {
 			t.Errorf("readData(%v) returned err: %v", tt.lines, err)
 		} else if string(data) != tt.data {
 			t.Errorf("readData(%v) returned %v, want %v", tt.lines, string(data), tt.data)
+		}
+	}
+}
+
+// Test reading of message data with maximum size set (see RFC 1870 section 6.3).
+func TestReadDataWithMaxSize(t *testing.T) {
+	tests := []struct {
+		lines string
+		maxSize int
+		err error
+	}{
+		// Maximum size of zero (the default) should not return an error.
+		{"Test message.\r\n.\r\n", 0, nil},
+
+		// Messages below the maximum size should not return an error.
+		{"Test message.\r\n.\r\n", 16, nil},
+
+		// Messages matching the maximum size should not return an error.
+		{"Test message.\r\n.\r\n", 15, nil},
+
+		// Messages above the maximum size should return a maximum size exceeded error.
+		{"Test message.\r\n.\r\n", 14, maxSizeExceeded(14)},
+	}
+	var buf bytes.Buffer
+	s := &session{}
+	s.br = bufio.NewReader(&buf)
+
+	for _, tt := range tests {
+		s.srv = &Server{MaxSize: tt.maxSize}
+		buf.Write([]byte(tt.lines))
+		_, err := s.readData()
+		if err != tt.err {
+			t.Errorf("readData(%v) returned err: %v", tt.lines, tt.err)
 		}
 	}
 }
