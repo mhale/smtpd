@@ -28,7 +28,7 @@ var (
 // Handler function called upon successful receipt of an email.
 type Handler func(remoteAddr net.Addr, from string, to []string, data []byte)
 
-// HandlerRcpt function called on RCPT. Return acccept status
+// HandlerRcpt function called on RCPT. Return accept status.
 type HandlerRcpt func(remoteAddr net.Addr, from string, to string) bool
 
 // ListenAndServe listens on the TCP network address addr
@@ -292,7 +292,8 @@ loop:
 
 			// Attempt to read message body from the socket.
 			// On timeout, send a timeout message and return from serve().
-			// On error, assume the client has gone away i.e. return from serve().
+			// On net.Error, assume the client has gone away i.e. return from serve().
+			// On other errors, allow the client to try again.
 			data, err := s.readData()
 			if err != nil {
 				switch err.(type) {
@@ -369,7 +370,7 @@ loop:
 			s.bw = bufio.NewWriter(s.conn)
 			s.tls = true
 
-			// RFC 3207 states the server must discard any prior knowledge obtained from the client.
+			// RFC 3207 specifies that the server must discard any prior knowledge obtained from the client.
 			s.remoteName = ""
 			from = ""
 			gotFrom = false
@@ -478,7 +479,7 @@ func (s *session) makeHeaders(to []string) []byte {
 func (s *session) makeEHLOResponse() (response string) {
 	response = fmt.Sprintf("250-%s greets %s\r\n", s.srv.Hostname, s.remoteName)
 
-	// RFC 1870 states "SIZE 0" indicates no maximum size is in force.
+	// RFC 1870 specifies that "SIZE 0" indicates no maximum size is in force.
 	response += fmt.Sprintf("250-SIZE %d\r\n", s.srv.MaxSize)
 
 	// Only list STARTTLS if TLS is configured, but not currently in use.

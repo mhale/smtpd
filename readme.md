@@ -143,7 +143,7 @@ ListenAndServe("127.0.0.1:2525", mailHandler, rcptHandler)
 
 The tests cover the supported SMTP command set and line parsing. A single server is created listening on an ephemeral port (52525) for the duration of the tests. Each test creates a new client connection for processing commands.
 
-For the TLS tests, a different server is created with a net.Pipe connection inside each individual test, in order to change the server settings for each test.
+For the TLS and size tests, a different server is created with a net.Pipe connection inside each individual test, in order to change the server settings for each test.
 
 The TLS support has also been manually tested with Go client code, Ruby client code, and macOS's Mail.app.
 
