@@ -57,8 +57,10 @@ func maxSizeExceeded(limit int) maxSizeExceededError {
 	return maxSizeExceededError{limit}
 }
 
+// Error uses the RFC 5321 response message in preference to RFC 1870.
+// RFC 3463 defines enhanced status code x.3.4 as "Message too big for system".
 func (err maxSizeExceededError) Error() string {
-	return fmt.Sprintf("552  Exceeded storage allocation (%d)", err.limit)
+	return fmt.Sprintf("552 5.3.4 Requested mail action aborted: exceeded storage allocation (%d)", err.limit)
 }
 
 // Server is an SMTP server.
@@ -278,7 +280,7 @@ loop:
 				case maxSizeExceededError:
 					s.writef(err.Error())
 				default:
-					s.writef("451 Local error in processing")
+					s.writef("451 4.3.0 Requested action aborted: local error in processing")
 				}
 				break loop
 			}
