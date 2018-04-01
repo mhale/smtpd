@@ -278,7 +278,7 @@ loop:
 						to = append(to, match[1])
 						s.writef("250 2.1.5 Ok")
 					} else {
-						s.writef("550 Mailbox unavailable")
+						s.writef("550 5.1.0 Requested action not taken: mailbox unavailable")
 					}
 				}
 			}
