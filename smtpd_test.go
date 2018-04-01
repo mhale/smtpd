@@ -136,8 +136,56 @@ func TestCmdMAIL(t *testing.T) {
 	// MAIL with valid FROM arg should return 250 Ok
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
 
+	// MAIL with valid SIZE parameter should return 250 Ok
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=1000", "250")
+
+	// MAIL with bad size parameter should return 501 syntax error
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE= ", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=foo", "501")
+
 	cmdCode(t, conn, "QUIT", "221")
 	conn.Close()
+}
+
+func TestCmdMAILMaxSize(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+
+	maxSize := 10 + time.Now().Minute()
+	server := &Server{MaxSize: maxSize}
+	session := server.newSession(serverConn)
+	go session.serve()
+
+	reader := bufio.NewReader(clientConn)
+	_, _ = reader.ReadString('\n') // Read greeting message first.
+
+	cmdCode(t, clientConn, "EHLO host.example.com", "250")
+
+	// MAIL with no size parameter should return 250 Ok
+	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com>", "250")
+
+	// MAIL with bad size parameter should return 501 syntax error
+	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com> SIZE", "501")
+	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com> SIZE=", "501")
+	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com> SIZE= ", "501")
+	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com> SIZE=foo", "501")
+
+	// MAIL with size parameter zero should return 250 Ok
+	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com> SIZE=0", "250")
+
+	// MAIL below the maximum size should return 250 Ok
+	cmdCode(t, clientConn, fmt.Sprintf("MAIL FROM:<sender@example.com> SIZE=%d", maxSize-1), "250")
+
+	// MAIL matching the maximum size should return 250 Ok
+	cmdCode(t, clientConn, fmt.Sprintf("MAIL FROM:<sender@example.com> SIZE=%d", maxSize), "250")
+
+	// MAIL above the maximum size should return a maximum size exceeded error.
+	cmdCode(t, clientConn, fmt.Sprintf("MAIL FROM:<sender@example.com> SIZE=%d", maxSize+1), "552")
+
+	// Clients should send either RSET or QUIT after receiving 552 (RFC 1870 section 6.2).
+	cmdCode(t, clientConn, "QUIT", "221")
+	clientConn.Close()
 }
 
 func TestCmdRCPT(t *testing.T) {
@@ -653,6 +701,27 @@ func TestMakeEHLOResponse(t *testing.T) {
 	extensions = parseExtensions(t, s.makeEHLOResponse())
 	if _, ok := extensions["STARTTLS"]; ok {
 		t.Errorf("STARTTLS appears in the extension list when TLS is already in use")
+	}
+
+	// Verify default SIZE extension is zero.
+	s.srv = &Server{}
+	extensions = parseExtensions(t, s.makeEHLOResponse())
+	if _, ok := extensions["SIZE"]; !ok {
+		t.Errorf("SIZE does not appear in the extension list")
+	} else if extensions["SIZE"] != "0" {
+		t.Errorf("SIZE appears in the extension list with incorrect parameter %s, want %s", extensions["SIZE"], "0")
+	}
+
+	// Verify configured maximum message size is listed correctly.
+	// Any integer will suffice, as long as it's not hardcoded.
+	maxSize := 10 + time.Now().Minute()
+	maxSizeStr := fmt.Sprintf("%d", maxSize)
+	s.srv = &Server{MaxSize: maxSize}
+	extensions = parseExtensions(t, s.makeEHLOResponse())
+	if _, ok := extensions["SIZE"]; !ok {
+		t.Errorf("SIZE does not appear in the extension list")
+	} else if extensions["SIZE"] != maxSizeStr {
+		t.Errorf("SIZE appears in the extension list with incorrect parameter %s, want %s", extensions["SIZE"], maxSizeStr)
 	}
 }
 

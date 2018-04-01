@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,7 +18,8 @@ import (
 var (
 	Debug      = false
 	rcptToRE   = regexp.MustCompile(`[Tt][Oo]:<(.+)>`)
-	mailFromRE = regexp.MustCompile(`[Ff][Rr][Oo][Mm]:<(.*)>`) // Delivery Status Notifications are sent with "MAIL FROM:<>"
+	mailFromRE = regexp.MustCompile(`[Ff][Rr][Oo][Mm]:<(.*)>(\s(.*))?`) // Delivery Status Notifications are sent with "MAIL FROM:<>"
+	mailSizeRE = regexp.MustCompile(`[Ss][Ii][Zz][Ee]=(\d+)`)
 
 	// Commands allowed when TLS is required but not in use as per RFC 3207. Any other command gets a 530 response.
 	allowedCmds = map[string]bool{"NOOP": true, "EHLO": true, "STARTTLS": true, "QUIT": true}
@@ -227,9 +229,30 @@ loop:
 			if match == nil {
 				s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid FROM parameter)")
 			} else {
-				from = match[1]
-				gotFrom = true
-				s.writef("250 2.1.0 Ok")
+				// Validate the SIZE parameter if one was sent.
+				if len(match[2]) > 0 { // A parameter is present
+					sizeMatch := mailSizeRE.FindStringSubmatch(match[3])
+					if sizeMatch == nil {
+						s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
+					} else {
+						// Enforce the maximum message size if one is set.
+						size, err := strconv.Atoi(sizeMatch[1])
+						if err != nil { // Bad SIZE parameter
+							s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
+						} else if s.srv.MaxSize > 0 && size > s.srv.MaxSize { // SIZE above maximum size, if set
+							err = maxSizeExceeded(s.srv.MaxSize)
+							s.writef(err.Error())
+						} else { // SIZE ok
+							from = match[1]
+							gotFrom = true
+							s.writef("250 2.1.0 Ok")
+						}
+					}
+				} else { // No parameters after FROM
+					from = match[1]
+					gotFrom = true
+					s.writef("250 2.1.0 Ok")
+				}
 			}
 			to = nil
 			buffer.Reset()
@@ -454,6 +477,9 @@ func (s *session) makeHeaders(to []string) []byte {
 // Create the greeting string sent in response to an EHLO command.
 func (s *session) makeEHLOResponse() (response string) {
 	response = fmt.Sprintf("250-%s greets %s\r\n", s.srv.Hostname, s.remoteName)
+
+	// RFC 1870 states "SIZE 0" indicates no maximum size is in force.
+	response += fmt.Sprintf("250-SIZE %d\r\n", s.srv.MaxSize)
 
 	// Only list STARTTLS if TLS is configured, but not currently in use.
 	if s.srv.TLSConfig != nil && s.tls == false {
