@@ -556,9 +556,9 @@ func TestReadData(t *testing.T) {
 // Test reading of message data with maximum size set (see RFC 1870 section 6.3).
 func TestReadDataWithMaxSize(t *testing.T) {
 	tests := []struct {
-		lines string
+		lines   string
 		maxSize int
-		err error
+		err     error
 	}{
 		// Maximum size of zero (the default) should not return an error.
 		{"Test message.\r\n.\r\n", 0, nil},

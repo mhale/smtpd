@@ -429,7 +429,7 @@ func (s *session) readData() ([]byte, error) {
 
 		// Enforce the maximum message size limit.
 		if s.srv.MaxSize > 0 {
-			if len(data) + len(line) > s.srv.MaxSize {
+			if len(data)+len(line) > s.srv.MaxSize {
 				_, _ = s.br.Discard(s.br.Buffered()) // Discard the buffer remnants.
 				return nil, maxSizeExceeded(s.srv.MaxSize)
 			}
