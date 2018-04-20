@@ -5,7 +5,10 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -16,6 +19,7 @@ import (
 )
 
 var (
+	// Debug `true` enables verbose logging:
 	Debug      = false
 	rcptToRE   = regexp.MustCompile(`[Tt][Oo]:<(.+)>`)
 	mailFromRE = regexp.MustCompile(`[Ff][Rr][Oo][Mm]:<(.*)>(\s(.*))?`) // Delivery Status Notifications are sent with "MAIL FROM:<>"
@@ -82,6 +86,38 @@ type Server struct {
 // ConfigureTLS creates a TLS configuration from certificate and key files.
 func (srv *Server) ConfigureTLS(certFile string, keyFile string) error {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return err
+	}
+	srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+	return nil
+}
+
+// ConfigureTLSWithPassphrase creates a TLS configuration from a certificate,
+// an encrypted key file and the associated passphrase:
+func (srv *Server) ConfigureTLSWithPassphrase(
+	certFile string,
+	keyFile string,
+	passphrase string,
+) error {
+	certPEMBlock, err := ioutil.ReadFile(certFile)
+	if err != nil {
+		return err
+	}
+	keyPEMBlock, err := ioutil.ReadFile(keyFile)
+	if err != nil {
+		return err
+	}
+	keyDERBlock, _ := pem.Decode(keyPEMBlock)
+	keyPEMDecrypted, err := x509.DecryptPEMBlock(keyDERBlock, []byte(passphrase))
+	if err != nil {
+		return err
+	}
+	var pemBlock pem.Block
+	pemBlock.Type = keyDERBlock.Type
+	pemBlock.Bytes = keyPEMDecrypted
+	keyPEMBlock = pem.EncodeToMemory(&pemBlock)
+	cert, err := tls.X509KeyPair(certPEMBlock, keyPEMBlock)
 	if err != nil {
 		return err
 	}
