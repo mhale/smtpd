@@ -69,6 +69,9 @@ func (err maxSizeExceededError) Error() string {
 	return fmt.Sprintf("552 5.3.4 Requested mail action aborted: exceeded storage allocation (%d)", err.limit)
 }
 
+// LogFunc is a function capable of logging the client-server communication.
+type LogFunc func(remoteIP, verb, line string)
+
 // Server is an SMTP server.
 type Server struct {
 	Addr        string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
@@ -76,6 +79,8 @@ type Server struct {
 	HandlerRcpt HandlerRcpt
 	Appname     string
 	Hostname    string
+	LogRead     LogFunc
+	LogWrite    LogFunc
 	Timeout     time.Duration
 	MaxSize     int // Maximum message size allowed, in bytes
 	TLSConfig   *tls.Config
@@ -146,7 +151,7 @@ func (srv *Server) ListenAndServe() error {
 	var err error
 
 	// If TLSListener is enabled, listen for TLS connections only.
-	if srv.TLSConfig != nil && srv.TLSListener == true {
+	if srv.TLSConfig != nil && srv.TLSListener {
 		ln, err = tls.Listen("tcp", srv.Addr, srv.TLSConfig)
 	} else {
 		ln, err = net.Listen("tcp", srv.Addr)
@@ -234,7 +239,7 @@ loop:
 		verb, args := s.parseLine(line)
 
 		// If TLS is configured and required, but not already in use, reject every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207.
-		if s.srv.TLSConfig != nil && s.srv.TLSRequired == true && s.tls == false {
+		if s.srv.TLSConfig != nil && s.srv.TLSRequired && !s.tls {
 			if _, ok := allowedCmds[verb]; !ok {
 				s.writef("530 5.7.0 Must issue a STARTTLS command first")
 				continue
@@ -385,7 +390,7 @@ loop:
 			}
 
 			// Handle case where STARTTLS is called more than once (in violation of RFC 3207).
-			if s.tls == true {
+			if s.tls {
 				s.writef("503 5.5.1 Bad sequence of commands (TLS already in use)")
 				break
 			}
@@ -425,11 +430,17 @@ func (s *session) writef(format string, args ...interface{}) error {
 		s.conn.SetWriteDeadline(time.Now().Add(s.srv.Timeout))
 	}
 
-	fmt.Fprintf(s.bw, format+"\r\n", args...)
+	line := fmt.Sprintf(format, args...)
+	fmt.Fprintf(s.bw, line+"\r\n")
 	err := s.bw.Flush()
 
 	if Debug {
-		log.Println(s.remoteIP, "WROTE", fmt.Sprintf(format, args...))
+		verb := "WROTE"
+		if s.srv.LogWrite != nil {
+			s.srv.LogWrite(s.remoteIP, verb, line)
+		} else {
+			log.Println(s.remoteIP, verb, line)
+		}
 	}
 
 	return err
@@ -448,7 +459,12 @@ func (s *session) readLine() (string, error) {
 	line = strings.TrimSpace(line) // Strip trailing \r\n
 
 	if Debug {
-		log.Println(s.remoteIP, "READ ", line)
+		verb := "READ"
+		if s.srv.LogRead != nil {
+			s.srv.LogRead(s.remoteIP, verb, line)
+		} else {
+			log.Println(s.remoteIP, verb, line)
+		}
 	}
 
 	return line, err
@@ -519,7 +535,7 @@ func (s *session) makeEHLOResponse() (response string) {
 	response += fmt.Sprintf("250-SIZE %d\r\n", s.srv.MaxSize)
 
 	// Only list STARTTLS if TLS is configured, but not currently in use.
-	if s.srv.TLSConfig != nil && s.tls == false {
+	if s.srv.TLSConfig != nil && !s.tls {
 		response += "250-STARTTLS\r\n"
 	}
 
