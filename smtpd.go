@@ -4,8 +4,12 @@ package smtpd
 import (
 	"bufio"
 	"bytes"
+	"crypto/hmac"
+	"crypto/md5"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
@@ -27,6 +31,9 @@ var (
 
 	// Commands allowed when TLS is required but not in use as per RFC 3207. Any other command gets a 530 response.
 	allowedCmds = map[string]bool{"NOOP": true, "EHLO": true, "STARTTLS": true, "QUIT": true}
+
+	// Auth methods allowed
+	allowedAuth = map[string]bool{"LOGIN": true, "PLAIN": true, "CRAM-MD5": true}
 )
 
 // Handler function called upon successful receipt of an email.
@@ -34,6 +41,11 @@ type Handler func(remoteAddr net.Addr, from string, to []string, data []byte)
 
 // HandlerRcpt function called on RCPT. Return accept status.
 type HandlerRcpt func(remoteAddr net.Addr, from string, to string) bool
+
+// AuthHandler function called when a login attempt is performed.
+// The function must return either the password for the specified user,
+// or an error if the user is not found.
+type AuthHandler func(remoteAddr net.Addr, user []byte) (password []byte, err error)
 
 // ListenAndServe listens on the TCP network address addr
 // and then calls Serve with handler to handle requests
@@ -77,6 +89,7 @@ type Server struct {
 	Addr        string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
 	Handler     Handler
 	HandlerRcpt HandlerRcpt
+	AuthHandler AuthHandler
 	Appname     string
 	Hostname    string
 	LogRead     LogFunc
@@ -220,6 +233,8 @@ func (s *session) serve() {
 	var gotFrom bool
 	var to []string
 	var buffer bytes.Buffer
+	var authType string
+	var authorized bool
 
 	// Send banner.
 	s.writef("220 %s %s ESMTP Service ready", s.srv.Hostname, s.srv.Appname)
@@ -255,6 +270,7 @@ loop:
 			from = ""
 			gotFrom = false
 			to = nil
+			authorized = false
 			buffer.Reset()
 		case "EHLO":
 			s.remoteName = args
@@ -264,8 +280,13 @@ loop:
 			from = ""
 			gotFrom = false
 			to = nil
+			authorized = false
 			buffer.Reset()
 		case "MAIL":
+			if s.srv.AuthHandler != nil && !authorized {
+				s.writef("530 Authentication required")
+				break
+			}
 			match := mailFromRE.FindStringSubmatch(args)
 			if match == nil {
 				s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid FROM parameter)")
@@ -298,6 +319,10 @@ loop:
 			to = nil
 			buffer.Reset()
 		case "RCPT":
+			if s.srv.AuthHandler != nil && !authorized {
+				s.writef("530 Authentication required")
+				break
+			}
 			if !gotFrom {
 				s.writef("503 5.5.1 Bad sequence of commands (MAIL required before RCPT)")
 				break
@@ -324,6 +349,10 @@ loop:
 				}
 			}
 		case "DATA":
+			if s.srv.AuthHandler != nil && !authorized {
+				s.writef("530 Authentication required")
+				break
+			}
 			if !gotFrom || to == nil {
 				s.writef("503 5.5.1 Bad sequence of commands (MAIL & RCPT required before DATA)")
 				break
@@ -417,6 +446,62 @@ loop:
 			gotFrom = false
 			to = nil
 			buffer.Reset()
+		case "AUTH":
+			// Handle case where AUTH is called more than once (in violation of RFC 4954).
+			if authType != "" {
+				s.writef("503 Bad sequence of commands (AUTH already specified for this session)")
+				break
+			}
+
+			var authArgs string
+
+			authType, authArgs = s.parseLine(args)
+
+			if authType == "" {
+				s.writef("501 Malformed auth input (argument required)")
+				break
+			}
+
+			if allowed, found := allowedAuth[authType]; !found || !allowed {
+				s.writef("504 5.5.2 Unrecognized authentication type")
+				break
+			}
+
+			switch authType {
+			case "PLAIN":
+				// RFC 4945 is very strict about the use of unprotected Userids/Passwords during
+				// the SMTP Auth dialoge:
+				// If an implementation supports SASL mechanisms that are vulnerable to passive
+				// eavesdropping attacks (such as [PLAIN]), then the implementation MUST support
+				// at least one configuration where these SASL mechanisms are not advertised or
+				// used without the presence of an external security layer such as [TLS].
+				if !s.tls {
+					s.writef("502 5.5.1 Cannot AUTH in plain text mode (use STARTTLS)")
+					continue loop
+				}
+				authorized, err = s.handleAuthPlain(authArgs)
+			case "LOGIN":
+				if !s.tls {
+					s.writef("502 5.5.1 Cannot AUTH in plain text mode (use STARTTLS)")
+					continue loop
+				}
+				authorized, err = s.handleAuthLogin(authArgs)
+			case "CRAM-MD5":
+				authorized, err = s.handleAuthCramMD5(authArgs)
+			}
+
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
+				}
+				break
+			}
+
+			if authorized {
+				s.writef("235 2.7.0 Authentication successful")
+			} else {
+				s.writef("535 Authentication credentials invalid")
+			}
 		default:
 			// See RFC 5321 section 4.2.4 for usage of 500 & 502 reply codes
 			s.writef("500 5.5.2 Syntax error, command unrecognized")
@@ -539,6 +624,124 @@ func (s *session) makeEHLOResponse() (response string) {
 		response += "250-STARTTLS\r\n"
 	}
 
+	if s.srv.AuthHandler != nil {
+		var methods []string
+		for k, allowed := range allowedAuth {
+			if allowed {
+				methods = append(methods, k)
+			}
+		}
+		if len(methods) > 0 {
+			response += "250-AUTH " + strings.Join(methods, " ") + "\r\n"
+		}
+	}
+
 	response += "250 ENHANCEDSTATUSCODES"
 	return
+}
+
+func (s *session) handleAuthLogin(arg string) (bool, error) {
+	var err error
+
+	if arg == "" {
+		s.writef("334 " + base64.StdEncoding.EncodeToString([]byte("Username:")))
+		arg, err = s.readLine()
+		if err != nil {
+			return false, err
+		}
+	}
+
+	username, err := base64.StdEncoding.DecodeString(arg)
+	if err != nil {
+		s.writef("502 Couldn't decode your credentials")
+		return false, fmt.Errorf("Authorization failed")
+	}
+
+	s.writef("334 " + base64.StdEncoding.EncodeToString([]byte("Password:")))
+	line, err := s.readLine()
+	if err != nil {
+		return false, err
+	}
+
+	password, err := base64.StdEncoding.DecodeString(line)
+	if err != nil {
+		s.writef("501 5.5.4 Syntax error in the argument (unable to decode)")
+		return false, fmt.Errorf("Authorization failed")
+	}
+
+	pass, err := s.srv.AuthHandler(s.conn.RemoteAddr(), username)
+	if err != nil || !bytes.Equal(pass, password) {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func (s *session) handleAuthPlain(arg string) (bool, error) {
+	var err error
+
+	if arg == "" {
+		s.writef("334")
+		arg, err = s.readLine()
+		if err != nil {
+			return false, err
+		}
+	}
+
+	data, err := base64.StdEncoding.DecodeString(arg)
+	if err != nil {
+		s.writef("502 Couldn't decode your credentials")
+		return false, fmt.Errorf("Authorization failed")
+	}
+
+	parts := bytes.Split(data, []byte{0})
+	if len(parts) != 3 {
+		s.writef("502 Couldn't decode your credentials")
+		return false, fmt.Errorf("Authorization failed")
+	}
+
+	pass, err := s.srv.AuthHandler(s.conn.RemoteAddr(), parts[1])
+	if err != nil || !bytes.Equal(pass, parts[2]) {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func (s *session) handleAuthCramMD5(arg string) (bool, error) {
+	shared := "<" + strconv.Itoa(os.Getpid()) + "." + strconv.Itoa(time.Now().Nanosecond()) + "@" + s.srv.Hostname + ">"
+
+	s.writef("334 " + base64.StdEncoding.EncodeToString([]byte(shared)))
+
+	data, err := s.readLine()
+	if err != nil {
+		return false, err
+	}
+
+	buf, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		s.writef("502 Couldn't decode your credentials")
+		return false, fmt.Errorf("Authorization failed")
+	}
+
+	fields := strings.Split(string(buf), " ")
+	if len(fields) < 2 {
+		s.writef("502 Wrong number of fields in the token")
+		return false, fmt.Errorf("Authorization failed")
+	}
+
+	pass, err := s.srv.AuthHandler(s.conn.RemoteAddr(), []byte(fields[0]))
+	if err != nil {
+		return false, nil
+	}
+
+	part1 := hmac.New(md5.New, pass)
+	part1.Write([]byte(shared))
+	part2 := hex.EncodeToString(part1.Sum(nil))
+
+	if part2 != fields[1] {
+		return false, nil
+	}
+
+	return true, nil
 }
