@@ -19,35 +19,10 @@ import (
 	"time"
 )
 
-// Create test server to run commands against.
-// Sleep to give ListenAndServe time to finishing listening before creating clients.
-// This seems to only be necessary since Go 1.5.
-// For specific TLS tests, a different server is created with a net.Pipe connection inside each individual test,
-// in order to change the server settings for each test.
-func init() {
-	server := &Server{Addr: "127.0.0.1:52525", Handler: nil}
-	go server.ListenAndServe()
-	time.Sleep(1 * time.Millisecond)
-}
+var cert = makeCertificate()
 
 // Create a client to run commands with. Parse the banner for 220 response.
-func newConn(t *testing.T) net.Conn {
-	conn, err := net.Dial("tcp", "127.0.0.1:52525")
-	if err != nil {
-		t.Fatalf("Failed to connect to test server: %v", err)
-	}
-	banner, readErr := bufio.NewReader(conn).ReadString('\n')
-	if readErr != nil {
-		t.Fatalf("Failed to read banner from test server: %v", readErr)
-	}
-	if banner[0:3] != "220" {
-		t.Fatalf("Read incorrect banner from test server: %v", banner)
-	}
-	return conn
-}
-
-// Create a client to run commands with. Parse the banner for 220 response.
-func newPipeConn(t *testing.T, server *Server) net.Conn {
+func newConn(t *testing.T, server *Server) net.Conn {
 	clientConn, serverConn := net.Pipe()
 	session := server.newSession(serverConn)
 	go session.serve()
@@ -93,7 +68,7 @@ func TestSimpleCommands(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		conn := newConn(t)
+		conn := newConn(t, &Server{})
 		cmdCode(t, conn, tt.cmd, tt.code)
 		cmdCode(t, conn, "QUIT", "221")
 		conn.Close()
@@ -101,7 +76,7 @@ func TestSimpleCommands(t *testing.T) {
 }
 
 func TestCmdHELO(t *testing.T) {
-	conn := newConn(t)
+	conn := newConn(t, &Server{})
 
 	// Send HELO, expect greeting.
 	cmdCode(t, conn, "HELO host.example.com", "250")
@@ -118,7 +93,7 @@ func TestCmdHELO(t *testing.T) {
 }
 
 func TestCmdEHLO(t *testing.T) {
-	conn := newConn(t)
+	conn := newConn(t, &Server{})
 
 	// Send EHLO, expect greeting.
 	cmdCode(t, conn, "EHLO host.example.com", "250")
@@ -135,7 +110,7 @@ func TestCmdEHLO(t *testing.T) {
 }
 
 func TestCmdRSET(t *testing.T) {
-	conn := newConn(t)
+	conn := newConn(t, &Server{})
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// Verify that RSET clears the current transaction state.
@@ -149,7 +124,7 @@ func TestCmdRSET(t *testing.T) {
 }
 
 func TestCmdMAIL(t *testing.T) {
-	conn := newConn(t)
+	conn := newConn(t, &Server{})
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// MAIL with no FROM arg should return 501 syntax error
@@ -179,46 +154,38 @@ func TestCmdMAIL(t *testing.T) {
 }
 
 func TestCmdMAILMaxSize(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-
 	maxSize := 10 + time.Now().Minute()
-	server := &Server{MaxSize: maxSize}
-	session := server.newSession(serverConn)
-	go session.serve()
-
-	reader := bufio.NewReader(clientConn)
-	_, _ = reader.ReadString('\n') // Read greeting message first.
-
-	cmdCode(t, clientConn, "EHLO host.example.com", "250")
+	conn := newConn(t, &Server{MaxSize: maxSize})
+	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// MAIL with no size parameter should return 250 Ok
-	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
 
 	// MAIL with bad size parameter should return 501 syntax error
-	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com> SIZE", "501")
-	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com> SIZE=", "501")
-	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com> SIZE= ", "501")
-	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com> SIZE=foo", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE= ", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=foo", "501")
 
 	// MAIL with size parameter zero should return 250 Ok
-	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com> SIZE=0", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=0", "250")
 
 	// MAIL below the maximum size should return 250 Ok
-	cmdCode(t, clientConn, fmt.Sprintf("MAIL FROM:<sender@example.com> SIZE=%d", maxSize-1), "250")
+	cmdCode(t, conn, fmt.Sprintf("MAIL FROM:<sender@example.com> SIZE=%d", maxSize-1), "250")
 
 	// MAIL matching the maximum size should return 250 Ok
-	cmdCode(t, clientConn, fmt.Sprintf("MAIL FROM:<sender@example.com> SIZE=%d", maxSize), "250")
+	cmdCode(t, conn, fmt.Sprintf("MAIL FROM:<sender@example.com> SIZE=%d", maxSize), "250")
 
 	// MAIL above the maximum size should return a maximum size exceeded error.
-	cmdCode(t, clientConn, fmt.Sprintf("MAIL FROM:<sender@example.com> SIZE=%d", maxSize+1), "552")
+	cmdCode(t, conn, fmt.Sprintf("MAIL FROM:<sender@example.com> SIZE=%d", maxSize+1), "552")
 
 	// Clients should send either RSET or QUIT after receiving 552 (RFC 1870 section 6.2).
-	cmdCode(t, clientConn, "QUIT", "221")
-	clientConn.Close()
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
 }
 
 func TestCmdRCPT(t *testing.T) {
-	conn := newConn(t)
+	conn := newConn(t, &Server{})
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// RCPT without prior MAIL should return 503 bad sequence
@@ -253,7 +220,7 @@ func TestCmdRCPT(t *testing.T) {
 }
 
 func TestCmdDATA(t *testing.T) {
-	conn := newConn(t)
+	conn := newConn(t, &Server{})
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// DATA without prior MAIL & RCPT should return 503 bad sequence
@@ -283,52 +250,44 @@ func TestCmdDATA(t *testing.T) {
 }
 
 func TestCmdDATAWithMaxSize(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-
 	// "Test message.\r\n." is 15 bytes after trailing period is removed.
-	server := &Server{MaxSize: 15}
-	session := server.newSession(serverConn)
-	go session.serve()
-
-	reader := bufio.NewReader(clientConn)
-	_, _ = reader.ReadString('\n') // Read greeting message first.
-
-	cmdCode(t, clientConn, "EHLO host.example.com", "250")
+	conn := newConn(t, &Server{MaxSize: 15})
+	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// Messages below the maximum size should return 250 Ok
-	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com>", "250")
-	cmdCode(t, clientConn, "RCPT TO:<recipient@example.com>", "250")
-	cmdCode(t, clientConn, "DATA", "354")
-	cmdCode(t, clientConn, "Test message\r\n.", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, conn, "DATA", "354")
+	cmdCode(t, conn, "Test message\r\n.", "250")
 
 	// Messages matching the maximum size should return 250 Ok
-	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com>", "250")
-	cmdCode(t, clientConn, "RCPT TO:<recipient@example.com>", "250")
-	cmdCode(t, clientConn, "DATA", "354")
-	cmdCode(t, clientConn, "Test message.\r\n.", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, conn, "DATA", "354")
+	cmdCode(t, conn, "Test message.\r\n.", "250")
 
 	// Messages above the maximum size should return a maximum size exceeded error.
-	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com>", "250")
-	cmdCode(t, clientConn, "RCPT TO:<recipient@example.com>", "250")
-	cmdCode(t, clientConn, "DATA", "354")
-	cmdCode(t, clientConn, "Test message that is too long.\r\n.", "552")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, conn, "DATA", "354")
+	cmdCode(t, conn, "Test message that is too long.\r\n.", "552")
 
 	// Clients should send either RSET or QUIT after receiving 552 (RFC 1870 section 6.2).
-	cmdCode(t, clientConn, "RSET", "250")
+	cmdCode(t, conn, "RSET", "250")
 
 	// Messages above the maximum size should return a maximum size exceeded error.
-	cmdCode(t, clientConn, "MAIL FROM:<sender@example.com>", "250")
-	cmdCode(t, clientConn, "RCPT TO:<recipient@example.com>", "250")
-	cmdCode(t, clientConn, "DATA", "354")
-	cmdCode(t, clientConn, "Test message.\r\nSecond line that is too long.\r\n.", "552")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, conn, "DATA", "354")
+	cmdCode(t, conn, "Test message.\r\nSecond line that is too long.\r\n.", "552")
 
 	// Clients should send either RSET or QUIT after receiving 552 (RFC 1870 section 6.2).
-	cmdCode(t, clientConn, "QUIT", "221")
-	clientConn.Close()
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
 }
 
 func TestCmdSTARTTLS(t *testing.T) {
-	conn := newConn(t)
+	conn := newConn(t, &Server{})
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// By default, TLS is not configured, so STARTTLS should return 502 not implemented.
@@ -342,25 +301,19 @@ func TestCmdSTARTTLS(t *testing.T) {
 }
 
 func TestCmdSTARTTLSFailure(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-
 	// Deliberately misconfigure TLS to force a handshake failure.
 	server := &Server{TLSConfig: &tls.Config{}}
-	session := server.newSession(serverConn)
-	go session.serve()
-
-	reader := bufio.NewReader(clientConn)
-	_, _ = reader.ReadString('\n') // Read greeting message first.
-
-	cmdCode(t, clientConn, "EHLO host.example.com", "250")
+	conn := newConn(t, server)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// When TLS is configured, STARTTLS should return 220 Ready to start TLS.
-	cmdCode(t, clientConn, "STARTTLS", "220")
+	cmdCode(t, conn, "STARTTLS", "220")
 
 	// A failed TLS handshake should return 403 TLS handshake failed
-	tlsConn := tls.Client(clientConn, &tls.Config{InsecureSkipVerify: true})
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
 	err := tlsConn.Handshake()
 	if err != nil {
+		reader := bufio.NewReader(conn)
 		resp, readErr := reader.ReadString('\n')
 		if readErr != nil {
 			t.Fatalf("Failed to read response after failed TLS handshake: %v", err)
@@ -368,14 +321,16 @@ func TestCmdSTARTTLSFailure(t *testing.T) {
 		if resp[0:3] != "403" {
 			t.Errorf("Failed TLS handshake response code is %s, want 403", resp[0:3])
 		}
+	} else {
+		t.Error("TLS handshake succeeded with empty tls.Config, want failure")
 	}
 
-	cmdCode(t, clientConn, "QUIT", "221")
+	cmdCode(t, conn, "QUIT", "221")
 	tlsConn.Close()
 }
 
 // Utility function to make a valid TLS certificate for use by the server.
-func makeCertificate(t *testing.T) tls.Certificate {
+func makeCertificate() tls.Certificate {
 	const certPEM = `
 -----BEGIN CERTIFICATE-----
 MIID9DCCAtygAwIBAgIJAIX/1sxuqZKrMA0GCSqGSIb3DQEBCwUAMFkxCzAJBgNV
@@ -430,33 +385,21 @@ twPDHLBcUNhHJx6JWTR6BxI5DZoIA1tcKHtdO5smjLWNSKhXTsKWee2aNkZJkNIW
 TDHSaTMOxVUEzpx84xClf561BTiTgzQy2MULpg3AK0Cv9l0+Yrvz
 -----END RSA PRIVATE KEY-----`
 
-	cert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
-	if err != nil {
-		t.Fatalf("Failed to configure TLS certificate: %v", err)
-	}
-
+	cert, _ := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
 	return cert
 }
 
 func TestCmdSTARTTLSSuccess(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-
 	// Configure a valid TLS certificate so the handshake will succeed.
-	cert := makeCertificate(t)
 	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}}
-	session := server.newSession(serverConn)
-	go session.serve()
-
-	reader := bufio.NewReader(clientConn)
-	_, _ = reader.ReadString('\n') // Read greeting message first.
-
-	cmdCode(t, clientConn, "EHLO host.example.com", "250")
+	conn := newConn(t, server)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// When TLS is configured, STARTTLS should return 220 Ready to start TLS.
-	cmdCode(t, clientConn, "STARTTLS", "220")
+	cmdCode(t, conn, "STARTTLS", "220")
 
 	// A successful TLS handshake shouldn't return anything, it should wait for EHLO.
-	tlsConn := tls.Client(clientConn, &tls.Config{InsecureSkipVerify: true})
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
 	err := tlsConn.Handshake()
 	if err != nil {
 		t.Errorf("Failed to perform TLS handshake")
@@ -492,27 +435,20 @@ func TestCmdSTARTTLSRequired(t *testing.T) {
 		{"AUTH", "530", "502"}, // AuthHandler not configured
 	}
 
-	clientConn, serverConn := net.Pipe()
-
 	// If TLS is not configured, the TLSRequired setting is ignored, so it must be configured for this test.
-	cert := makeCertificate(t)
 	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, TLSRequired: true}
-	session := server.newSession(serverConn)
-	go session.serve()
-
-	reader := bufio.NewReader(clientConn)
-	_, _ = reader.ReadString('\n') // Read greeting message first.
+	conn := newConn(t, server)
 
 	// If TLS is required, but not in use, reject every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207 section 4.
 	for _, tt := range tests {
-		cmdCode(t, clientConn, tt.cmd, tt.codeBefore)
+		cmdCode(t, conn, tt.cmd, tt.codeBefore)
 	}
 
 	// Switch to using TLS.
-	cmdCode(t, clientConn, "STARTTLS", "220")
+	cmdCode(t, conn, "STARTTLS", "220")
 
 	// A successful TLS handshake shouldn't return anything, it should wait for EHLO.
-	tlsConn := tls.Client(clientConn, &tls.Config{InsecureSkipVerify: true})
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
 	err := tlsConn.Handshake()
 	if err != nil {
 		t.Errorf("Failed to perform TLS handshake")
@@ -708,9 +644,7 @@ func parseExtensions(t *testing.T, greeting string) map[string]string {
 // Handler function for validating authentication credentials.
 // The secret parameter is passed as nil for LOGIN and PLAIN authentication mechanisms.
 func authHandler(remoteAddr net.Addr, mechanism string, username []byte, password []byte, shared []byte) (bool, error) {
-	//	return string(username) == "valid" && string(password) == "password", nil
 	return string(username) == "valid", nil
-
 }
 
 // Test the extensions listed in response to an EHLO command.
@@ -964,7 +898,7 @@ func TestAuthMechs(t *testing.T) {
 
 func TestCmdAUTH(t *testing.T) {
 	server := &Server{}
-	conn := newPipeConn(t, server)
+	conn := newConn(t, server)
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// By default no authentication handler is configured, so AUTH should return 502 not implemented.
@@ -976,7 +910,7 @@ func TestCmdAUTH(t *testing.T) {
 
 func TestCmdAUTHOptional(t *testing.T) {
 	server := &Server{AuthHandler: authHandler}
-	conn := newPipeConn(t, server)
+	conn := newConn(t, server)
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// AUTH without mechanism parameter must return 501 syntax error.
@@ -1017,7 +951,7 @@ func TestCmdAUTHOptional(t *testing.T) {
 
 func TestCmdAUTHRequired(t *testing.T) {
 	server := &Server{AuthHandler: authHandler, AuthRequired: true}
-	conn := newPipeConn(t, server)
+	conn := newConn(t, server)
 
 	tests := []struct {
 		cmd        string
@@ -1065,9 +999,8 @@ func TestCmdAUTHRequired(t *testing.T) {
 }
 
 func TestCmdAUTHLOGIN(t *testing.T) {
-	cert := makeCertificate(t)
 	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler}
-	conn := newPipeConn(t, server)
+	conn := newConn(t, server)
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// AUTH LOGIN without TLS in use must return 504 unrecognised type.
@@ -1123,9 +1056,8 @@ func TestCmdAUTHLOGIN(t *testing.T) {
 }
 
 func TestCmdAUTHLOGINFast(t *testing.T) {
-	cert := makeCertificate(t)
 	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler}
-	conn := newPipeConn(t, server)
+	conn := newConn(t, server)
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// AUTH LOGIN without TLS in use must return 504 unrecognised type.
@@ -1176,9 +1108,8 @@ func TestCmdAUTHLOGINFast(t *testing.T) {
 }
 
 func TestCmdAUTHPLAIN(t *testing.T) {
-	cert := makeCertificate(t)
 	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler}
-	conn := newPipeConn(t, server)
+	conn := newConn(t, server)
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// AUTH PLAIN without TLS in use must return 504 unrecognised type.
@@ -1236,9 +1167,8 @@ func TestCmdAUTHPLAIN(t *testing.T) {
 }
 
 func TestCmdAUTHPLAINEmpty(t *testing.T) {
-	cert := makeCertificate(t)
 	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler}
-	conn := newPipeConn(t, server)
+	conn := newConn(t, server)
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// AUTH PLAIN without TLS in use must return 504 unrecognised type.
@@ -1296,9 +1226,8 @@ func TestCmdAUTHPLAINEmpty(t *testing.T) {
 }
 
 func TestCmdAUTHPLAINFast(t *testing.T) {
-	cert := makeCertificate(t)
 	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler}
-	conn := newPipeConn(t, server)
+	conn := newConn(t, server)
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// AUTH PLAIN without TLS in use must return 504 unrecognised type.
@@ -1349,9 +1278,8 @@ func TestCmdAUTHPLAINFast(t *testing.T) {
 }
 
 func TestCmdAUTHPLAINFastAndEmpty(t *testing.T) {
-	cert := makeCertificate(t)
 	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler}
-	conn := newPipeConn(t, server)
+	conn := newConn(t, server)
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// AUTH PLAIN without TLS in use must return 504 unrecognised type.
@@ -1416,7 +1344,7 @@ func makeCRAMMD5Response(challenge string, username string, secret string) (stri
 
 func TestCmdAUTHCRAMMD5(t *testing.T) {
 	server := &Server{AuthHandler: authHandler}
-	conn := newPipeConn(t, server)
+	conn := newConn(t, server)
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// AUTH CRAM-MD5 without TLS in use can proceed.
@@ -1472,9 +1400,8 @@ func TestCmdAUTHCRAMMD5(t *testing.T) {
 }
 
 func TestCmdAUTHCRAMMD5WithTLS(t *testing.T) {
-	cert := makeCertificate(t)
 	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler}
-	conn := newPipeConn(t, server)
+	conn := newConn(t, server)
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
 	// Upgrade to TLS.
