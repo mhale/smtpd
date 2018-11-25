@@ -3,12 +3,17 @@ package smtpd
 import (
 	"bufio"
 	"bytes"
+	"crypto/hmac"
+	"crypto/md5"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
 	"os"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +22,8 @@ import (
 // Create test server to run commands against.
 // Sleep to give ListenAndServe time to finishing listening before creating clients.
 // This seems to only be necessary since Go 1.5.
-// For specific TLS tests, a different server is created with a net.Pipe connection inside each individual test, in order to change the server settings for each test.
+// For specific TLS tests, a different server is created with a net.Pipe connection inside each individual test,
+// in order to change the server settings for each test.
 func init() {
 	server := &Server{Addr: "127.0.0.1:52525", Handler: nil}
 	go server.ListenAndServe()
@@ -40,8 +46,24 @@ func newConn(t *testing.T) net.Conn {
 	return conn
 }
 
+// Create a client to run commands with. Parse the banner for 220 response.
+func newPipeConn(t *testing.T, server *Server) net.Conn {
+	clientConn, serverConn := net.Pipe()
+	session := server.newSession(serverConn)
+	go session.serve()
+
+	banner, err := bufio.NewReader(clientConn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read banner from test server: %v", err)
+	}
+	if banner[0:3] != "220" {
+		t.Fatalf("Read incorrect banner from test server: %v", banner)
+	}
+	return clientConn
+}
+
 // Send a command and verify the 3 digit code from the response.
-func cmdCode(t *testing.T, conn net.Conn, cmd string, code string) {
+func cmdCode(t *testing.T, conn net.Conn, cmd string, code string) string {
 	fmt.Fprintf(conn, "%s\r\n", cmd)
 	resp, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
@@ -50,6 +72,7 @@ func cmdCode(t *testing.T, conn net.Conn, cmd string, code string) {
 	if resp[0:3] != code {
 		t.Errorf("Command \"%s\" response code is %s, want %s", cmd, resp[0:3], code)
 	}
+	return strings.TrimSpace(resp)
 }
 
 // Simple tests: connect, send command, then send QUIT.
@@ -146,6 +169,10 @@ func TestCmdMAIL(t *testing.T) {
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=", "501")
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE= ", "501")
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=foo", "501")
+
+	// TODO: MAIL with valid AUTH parameter should return 250 Ok
+
+	// TODO: MAIL with invalid AUTH parameter must return 501 syntax error
 
 	cmdCode(t, conn, "QUIT", "221")
 	conn.Close()
@@ -304,8 +331,11 @@ func TestCmdSTARTTLS(t *testing.T) {
 	conn := newConn(t)
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 
-	// By default, TLS is not configured, so STARTTLS should return 502 not implemented
+	// By default, TLS is not configured, so STARTTLS should return 502 not implemented.
 	cmdCode(t, conn, "STARTTLS", "502")
+
+	// Parameters are not allowed (RFC 3207 section 4).
+	cmdCode(t, conn, "STARTTLS FOO", "501")
 
 	cmdCode(t, conn, "QUIT", "221")
 	conn.Close()
@@ -324,7 +354,7 @@ func TestCmdSTARTTLSFailure(t *testing.T) {
 
 	cmdCode(t, clientConn, "EHLO host.example.com", "250")
 
-	// When TLS is configured, STARTTLS should return 220 Ready to start TLS
+	// When TLS is configured, STARTTLS should return 220 Ready to start TLS.
 	cmdCode(t, clientConn, "STARTTLS", "220")
 
 	// A failed TLS handshake should return 403 TLS handshake failed
@@ -422,7 +452,7 @@ func TestCmdSTARTTLSSuccess(t *testing.T) {
 
 	cmdCode(t, clientConn, "EHLO host.example.com", "250")
 
-	// When TLS is configured, STARTTLS should return 220 Ready to start TLS
+	// When TLS is configured, STARTTLS should return 220 Ready to start TLS.
 	cmdCode(t, clientConn, "STARTTLS", "220")
 
 	// A successful TLS handshake shouldn't return anything, it should wait for EHLO.
@@ -435,7 +465,7 @@ func TestCmdSTARTTLSSuccess(t *testing.T) {
 	// The subsequent EHLO should be successful.
 	cmdCode(t, tlsConn, "EHLO host.example.com", "250")
 
-	// When TLS is already in use, STARTTLS should return 503 bad sequence
+	// When TLS is already in use, STARTTLS should return 503 bad sequence.
 	cmdCode(t, tlsConn, "STARTTLS", "503")
 
 	cmdCode(t, tlsConn, "QUIT", "221")
@@ -454,11 +484,12 @@ func TestCmdSTARTTLSRequired(t *testing.T) {
 		{"RCPT TO:<recipient@example.com>", "530", "250"},
 		{"RSET", "530", "250"}, // Reset before DATA to avoid having to actually send a message.
 		{"DATA", "530", "503"},
-		{"HELP", "530", "502"},
-		{"VRFY", "530", "502"},
-		{"EXPN", "530", "502"},
-		{"TEST", "530", "500"}, // Unsupported command
-		{"", "530", "500"},     // Blank command
+		{"HELP", "502", "502"},
+		{"VRFY", "502", "502"},
+		{"EXPN", "502", "502"},
+		{"TEST", "500", "500"}, // Unsupported command
+		{"", "500", "500"},     // Blank command
+		{"AUTH", "530", "502"}, // AuthHandler not configured
 	}
 
 	clientConn, serverConn := net.Pipe()
@@ -674,6 +705,14 @@ func parseExtensions(t *testing.T, greeting string) map[string]string {
 	return extensions
 }
 
+// Handler function for validating authentication credentials.
+// The secret parameter is passed as nil for LOGIN and PLAIN authentication mechanisms.
+func authHandler(remoteAddr net.Addr, mechanism string, username []byte, password []byte, shared []byte) (bool, error) {
+	//	return string(username) == "valid" && string(password) == "password", nil
+	return string(username) == "valid", nil
+
+}
+
 // Test the extensions listed in response to an EHLO command.
 func TestMakeEHLOResponse(t *testing.T) {
 	s := &session{}
@@ -724,6 +763,43 @@ func TestMakeEHLOResponse(t *testing.T) {
 		t.Errorf("SIZE does not appear in the extension list")
 	} else if extensions["SIZE"] != maxSizeStr {
 		t.Errorf("SIZE appears in the extension list with incorrect parameter %s, want %s", extensions["SIZE"], maxSizeStr)
+	}
+
+	// With no authentication handler configured, AUTH should not be advertised.
+	s.srv = &Server{}
+	extensions = parseExtensions(t, s.makeEHLOResponse())
+	if _, ok := extensions["AUTH"]; ok {
+		t.Errorf("AUTH appears in the extension list when no AuthHandler is specified")
+	}
+
+	// With an authentication handler configured, AUTH should be advertised.
+	s.srv = &Server{AuthHandler: authHandler}
+	extensions = parseExtensions(t, s.makeEHLOResponse())
+	if _, ok := extensions["AUTH"]; !ok {
+		t.Errorf("AUTH does not appear in the extension list when an AuthHandler is specified")
+	}
+
+	reLogin := regexp.MustCompile("\\bLOGIN\\b")
+	rePlain := regexp.MustCompile("\\bPLAIN\\b")
+
+	// RFC 4954 specifies that, without TLS in use, plaintext authentication mechanisms must not be advertised.
+	s.tls = false
+	extensions = parseExtensions(t, s.makeEHLOResponse())
+	if reLogin.MatchString(extensions["AUTH"]) {
+		t.Errorf("AUTH mechanism LOGIN appears in the extension list when an AuthHandler is specified and TLS is not in use")
+	}
+	if rePlain.MatchString(extensions["AUTH"]) {
+		t.Errorf("AUTH mechanism PLAIN appears in the extension list when an AuthHandler is specified and TLS is not in use")
+	}
+
+	// RFC 4954 specifies that, with TLS in use, plaintext authentication mechanisms can be advertised.
+	s.tls = true
+	extensions = parseExtensions(t, s.makeEHLOResponse())
+	if !reLogin.MatchString(extensions["AUTH"]) {
+		t.Errorf("AUTH mechanism LOGIN does not appear in the extension list when an AuthHandler is specified and TLS is in use")
+	}
+	if !rePlain.MatchString(extensions["AUTH"]) {
+		t.Errorf("AUTH mechanism PLAIN does not appear in the extension list when an AuthHandler is specified and TLS is in use")
 	}
 }
 
@@ -832,11 +908,640 @@ func TestConfigureTLSWithPassphrase(t *testing.T) {
 	}
 }
 
+func TestAuthMechs(t *testing.T) {
+	s := session{}
+	s.srv = &Server{}
+
+	// Validate that non-TLS (default) configuration does not allow plaintext authentication mechanisms.
+	correct := map[string]bool{"LOGIN": false, "PLAIN": false, "CRAM-MD5": true}
+	mechs := s.authMechs()
+	if !reflect.DeepEqual(mechs, correct) {
+		t.Errorf("authMechs() returned %v, want %v", mechs, correct)
+	}
+
+	// Validate that TLS configuration allows plaintext authentication mechanisms.
+	correct = map[string]bool{"LOGIN": true, "PLAIN": true, "CRAM-MD5": true}
+	s.tls = true
+	mechs = s.authMechs()
+	if !reflect.DeepEqual(mechs, correct) {
+		t.Errorf("authMechs() returned %v, want %v", mechs, correct)
+	}
+
+	// Validate that overridden values take precedence over RFC compliance when not using TLS.
+	correct = map[string]bool{"LOGIN": true, "PLAIN": true, "CRAM-MD5": false}
+	s.tls = false
+	s.srv.AuthMechs = map[string]bool{"LOGIN": true, "PLAIN": true, "CRAM-MD5": false}
+	mechs = s.authMechs()
+	if !reflect.DeepEqual(mechs, correct) {
+		t.Errorf("authMechs() returned %v, want %v", mechs, correct)
+	}
+
+	// Validate that overridden values take precedence over RFC compliance when using TLS.
+	correct = map[string]bool{"LOGIN": false, "PLAIN": false, "CRAM-MD5": true}
+	s.tls = true
+	s.srv.AuthMechs = map[string]bool{"LOGIN": false, "PLAIN": false, "CRAM-MD5": true}
+	mechs = s.authMechs()
+	if !reflect.DeepEqual(mechs, correct) {
+		t.Errorf("authMechs() returned %v, want %v", mechs, correct)
+	}
+
+	// Validate ability to explicitly disallow all mechanisms.
+	correct = map[string]bool{"LOGIN": false, "PLAIN": false, "CRAM-MD5": false}
+	s.srv.AuthMechs = map[string]bool{"LOGIN": false, "PLAIN": false, "CRAM-MD5": false}
+	mechs = s.authMechs()
+	if !reflect.DeepEqual(mechs, correct) {
+		t.Errorf("authMechs() returned %v, want %v", mechs, correct)
+	}
+
+	// Validate ability to explicitly allow all mechanisms.
+	correct = map[string]bool{"LOGIN": true, "PLAIN": true, "CRAM-MD5": true}
+	s.srv.AuthMechs = map[string]bool{"LOGIN": true, "PLAIN": true, "CRAM-MD5": true}
+	mechs = s.authMechs()
+	if !reflect.DeepEqual(mechs, correct) {
+		t.Errorf("authMechs() returned %v, want %v", mechs, correct)
+	}
+}
+
+func TestCmdAUTH(t *testing.T) {
+	server := &Server{}
+	conn := newPipeConn(t, server)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+
+	// By default no authentication handler is configured, so AUTH should return 502 not implemented.
+	cmdCode(t, conn, "AUTH", "502")
+
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+}
+
+func TestCmdAUTHOptional(t *testing.T) {
+	server := &Server{AuthHandler: authHandler}
+	conn := newPipeConn(t, server)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+
+	// AUTH without mechanism parameter must return 501 syntax error.
+	cmdCode(t, conn, "AUTH", "501")
+
+	// AUTH with a supported mechanism should return 334.
+	cmdCode(t, conn, "AUTH CRAM-MD5", "334")
+
+	// AUTH must support cancellation with '*' and return 501 syntax error.
+	cmdCode(t, conn, "*", "501")
+
+	// AUTH with an unsupported mechanism should return 504 unrecognized type.
+	cmdCode(t, conn, "AUTH FOO", "504")
+
+	// The LOGIN and PLAIN mechanisms require a TLS connection, and are disabled by default.
+	cmdCode(t, conn, "AUTH LOGIN", "504")
+	cmdCode(t, conn, "AUTH PLAIN", "504")
+
+	// AUTH attempt during a mail transaction must return 503 bad sequence.
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "AUTH CRAM-MD5", "503")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, conn, "AUTH CRAM-MD5", "503")
+
+	// AUTH after a mail transaction must return 334.
+	// TODO: Work out what should happen if AUTH is received after DATA.
+	cmdCode(t, conn, "DATA", "354")
+	cmdCode(t, conn, "Test message\r\n.", "250")
+	cmdCode(t, conn, "AUTH CRAM-MD5", "334")
+
+	// Cancel the authentication attempt, otherwise the QUIT below will return 502.
+	// TODO: Work out what should happen if QUIT is received after AUTH.
+	cmdCode(t, conn, "*", "501")
+
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+}
+
+func TestCmdAUTHRequired(t *testing.T) {
+	server := &Server{AuthHandler: authHandler, AuthRequired: true}
+	conn := newPipeConn(t, server)
+
+	tests := []struct {
+		cmd        string
+		codeBefore string
+		codeAfter  string
+	}{
+		{"EHLO host.example.com", "250", "250"},
+		{"NOOP", "250", "250"},
+		{"MAIL FROM:<sender@example.com>", "530", "250"},
+		{"RCPT TO:<recipient@example.com>", "530", "250"},
+		{"RSET", "250", "250"}, // Reset before DATA to avoid having to actually send a message.
+		{"DATA", "530", "503"},
+		{"HELP", "502", "502"},
+		{"VRFY", "502", "502"},
+		{"EXPN", "502", "502"},
+		{"TEST", "500", "500"},     // Unsupported command
+		{"", "500", "500"},         // Blank command
+		{"STARTTLS", "502", "502"}, // TLS not configured
+	}
+
+	// If authentication is configured and required, but not already in use, reject every command except
+	// AUTH, EHLO, HELO, NOOP, RSET, or QUIT as per RFC 4954.
+	for _, tt := range tests {
+		cmdCode(t, conn, tt.cmd, tt.codeBefore)
+	}
+
+	// AUTH without mechanism parameter must return 501 syntax error.
+	cmdCode(t, conn, "AUTH", "501")
+
+	// AUTH with a supported mechanism should return 334.
+	cmdCode(t, conn, "AUTH CRAM-MD5", "334")
+
+	// AUTH must support cancellation with '*' and return 501 syntax error.
+	cmdCode(t, conn, "*", "501")
+
+	// AUTH with an unsupported mechanism should return 504 unrecognized type.
+	cmdCode(t, conn, "AUTH FOO", "504")
+
+	// The LOGIN and PLAIN mechanisms require a TLS connection, and are disabled by default.
+	cmdCode(t, conn, "AUTH LOGIN", "504")
+	cmdCode(t, conn, "AUTH PLAIN", "504")
+
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+}
+
+func TestCmdAUTHLOGIN(t *testing.T) {
+	cert := makeCertificate(t)
+	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler}
+	conn := newPipeConn(t, server)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+
+	// AUTH LOGIN without TLS in use must return 504 unrecognised type.
+	cmdCode(t, conn, "AUTH LOGIN", "504")
+
+	// Upgrade to TLS.
+	cmdCode(t, conn, "STARTTLS", "220")
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	err := tlsConn.Handshake()
+	if err != nil {
+		t.Errorf("Failed to perform TLS handshake")
+	}
+	cmdCode(t, tlsConn, "EHLO host.example.com", "250")
+
+	// AUTH LOGIN with TLS in use can proceed.
+
+	// LOGIN authentication process:
+	// Client sends "AUTH LOGIN"
+	// Server sends "334 VXNlcm5hbWU6" (Base64-encoded "Username:").
+	// Client sends Base64-encoded username.
+	// Server sends "334 UGFzc3dvcmQ6" (Base64-encoded "Password:").
+	// Client sends Base64-encoded password.
+	invalidBase64 := "==" // Invalid Base64 string.
+	validUsername := base64.StdEncoding.EncodeToString([]byte("valid"))
+	invalidUsername := base64.StdEncoding.EncodeToString([]byte("invalid"))
+	password := base64.StdEncoding.EncodeToString([]byte("password"))
+
+	// Corrupt credentials must return 501 syntax error.
+	cmdCode(t, tlsConn, "AUTH LOGIN", "334")
+	cmdCode(t, tlsConn, invalidBase64, "501")
+
+	cmdCode(t, tlsConn, "AUTH LOGIN", "334")
+	cmdCode(t, tlsConn, validUsername, "334")
+	cmdCode(t, tlsConn, invalidBase64, "501")
+
+	// Invalid credentials must return 535 authentication credentials invalid.
+	cmdCode(t, tlsConn, "AUTH LOGIN", "334")
+	cmdCode(t, tlsConn, invalidUsername, "334")
+	cmdCode(t, tlsConn, password, "535")
+
+	// Valid credentials must return 235 authentication succeeded.
+	cmdCode(t, tlsConn, "AUTH LOGIN", "334")
+	cmdCode(t, tlsConn, validUsername, "334")
+	cmdCode(t, tlsConn, password, "235")
+
+	// AUTH after prior successful AUTH must return 503 bad sequence.
+	cmdCode(t, tlsConn, "AUTH LOGIN", "503")
+	cmdCode(t, tlsConn, "AUTH PLAIN", "503")
+	cmdCode(t, tlsConn, "AUTH CRAM-MD5", "503")
+
+	cmdCode(t, tlsConn, "QUIT", "221")
+	tlsConn.Close()
+}
+
+func TestCmdAUTHLOGINFast(t *testing.T) {
+	cert := makeCertificate(t)
+	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler}
+	conn := newPipeConn(t, server)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+
+	// AUTH LOGIN without TLS in use must return 504 unrecognised type.
+	cmdCode(t, conn, "AUTH LOGIN", "504")
+
+	// Upgrade to TLS.
+	cmdCode(t, conn, "STARTTLS", "220")
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	err := tlsConn.Handshake()
+	if err != nil {
+		t.Errorf("Failed to perform TLS handshake")
+	}
+	cmdCode(t, tlsConn, "EHLO host.example.com", "250")
+
+	// AUTH LOGIN with TLS in use can proceed.
+
+	// Fast LOGIN authentication process:
+	// Client sends "AUTH LOGIN " plus Base64-encoded username.
+	// Server sends "334 UGFzc3dvcmQ6" (Base64-encoded "Password:").
+	// Client sends Base64-encoded password.
+	invalidBase64 := "==" // Invalid Base64 string.
+	validUsername := base64.StdEncoding.EncodeToString([]byte("valid"))
+	invalidUsername := base64.StdEncoding.EncodeToString([]byte("invalid"))
+	password := base64.StdEncoding.EncodeToString([]byte("password"))
+
+	// Corrupt credentials must return 501 syntax error.
+	cmdCode(t, tlsConn, "AUTH LOGIN "+invalidBase64, "501")
+
+	cmdCode(t, tlsConn, "AUTH LOGIN "+validUsername, "334")
+	cmdCode(t, tlsConn, invalidBase64, "501")
+
+	// Invalid credentials must return 535 authentication credentials invalid.
+	cmdCode(t, tlsConn, "AUTH LOGIN "+invalidUsername, "334")
+	cmdCode(t, tlsConn, password, "535")
+
+	// Valid credentials must return 235 authentication succeeded.
+	cmdCode(t, tlsConn, "AUTH LOGIN", "334")
+	cmdCode(t, tlsConn, validUsername, "334")
+	cmdCode(t, tlsConn, password, "235")
+
+	// AUTH after prior successful AUTH must return 503 bad sequence.
+	cmdCode(t, tlsConn, "AUTH LOGIN", "503")
+	cmdCode(t, tlsConn, "AUTH PLAIN", "503")
+	cmdCode(t, tlsConn, "AUTH CRAM-MD5", "503")
+
+	cmdCode(t, tlsConn, "QUIT", "221")
+	tlsConn.Close()
+}
+
+func TestCmdAUTHPLAIN(t *testing.T) {
+	cert := makeCertificate(t)
+	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler}
+	conn := newPipeConn(t, server)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+
+	// AUTH PLAIN without TLS in use must return 504 unrecognised type.
+	cmdCode(t, conn, "AUTH PLAIN", "504")
+
+	// Upgrade to TLS.
+	cmdCode(t, conn, "STARTTLS", "220")
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	err := tlsConn.Handshake()
+	if err != nil {
+		t.Errorf("Failed to perform TLS handshake")
+	}
+	cmdCode(t, tlsConn, "EHLO host.example.com", "250")
+
+	// AUTH PLAIN with TLS in use can proceed.
+	// RFC 2595 specifies:
+	// The client sends the authorization identity (identity to
+	// login as), followed by a US-ASCII NUL character, followed by the
+	// authentication identity (identity whose password will be used),
+	// followed by a US-ASCII NUL character, followed by the clear-text
+	// password.  The client may leave the authorization identity empty to
+	// indicate that it is the same as the authentication identity.
+
+	// PLAIN authentication process:
+	// Client sends "AUTH PLAIN"
+	// Server sends "334 " (RFC 4954 requires the space).
+	// Client sends Base64-encoded string: identity\0username\0password
+	invalidBase64 := "==" // Invalid Base64 string.
+	missingNUL := base64.StdEncoding.EncodeToString([]byte("valid\x00password"))
+	valid := base64.StdEncoding.EncodeToString([]byte("identity\x00valid\x00password"))
+	invalid := base64.StdEncoding.EncodeToString([]byte("identity\x00invalid\x00password"))
+
+	// Corrupt credentials must return 501 syntax error.
+	cmdCode(t, tlsConn, "AUTH PLAIN", "334")
+	cmdCode(t, tlsConn, invalidBase64, "501")
+
+	cmdCode(t, tlsConn, "AUTH PLAIN", "334")
+	cmdCode(t, tlsConn, missingNUL, "501")
+
+	// Invalid credentials must return 535 authentication credentials invalid.
+	cmdCode(t, tlsConn, "AUTH PLAIN", "334")
+	cmdCode(t, tlsConn, invalid, "535")
+
+	// Valid credentials must return 235 authentication succeeded.
+	cmdCode(t, tlsConn, "AUTH PLAIN", "334")
+	cmdCode(t, tlsConn, valid, "235")
+
+	// AUTH after prior successful AUTH must return 503 bad sequence.
+	cmdCode(t, tlsConn, "AUTH LOGIN", "503")
+	cmdCode(t, tlsConn, "AUTH PLAIN", "503")
+	cmdCode(t, tlsConn, "AUTH CRAM-MD5", "503")
+
+	cmdCode(t, tlsConn, "QUIT", "221")
+	tlsConn.Close()
+}
+
+func TestCmdAUTHPLAINEmpty(t *testing.T) {
+	cert := makeCertificate(t)
+	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler}
+	conn := newPipeConn(t, server)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+
+	// AUTH PLAIN without TLS in use must return 504 unrecognised type.
+	cmdCode(t, conn, "AUTH PLAIN", "504")
+
+	// Upgrade to TLS.
+	cmdCode(t, conn, "STARTTLS", "220")
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	err := tlsConn.Handshake()
+	if err != nil {
+		t.Errorf("Failed to perform TLS handshake")
+	}
+	cmdCode(t, tlsConn, "EHLO host.example.com", "250")
+
+	// AUTH PLAIN with TLS in use can proceed.
+	// RFC 2595 specifies:
+	// The client sends the authorization identity (identity to
+	// login as), followed by a US-ASCII NUL character, followed by the
+	// authentication identity (identity whose password will be used),
+	// followed by a US-ASCII NUL character, followed by the clear-text
+	// password.  The client may leave the authorization identity empty to
+	// indicate that it is the same as the authentication identity.
+
+	// PLAIN authentication process with empty authorisation identity:
+	// Client sends "AUTH PLAIN"
+	// Server sends "334 " (RFC 4954 requires the space).
+	// Client sends Base64-encoded string: \0username\0password
+	invalidBase64 := "==" // Invalid Base64 string.
+	missingNUL := base64.StdEncoding.EncodeToString([]byte("valid\x00password"))
+	valid := base64.StdEncoding.EncodeToString([]byte("\x00valid\x00password"))
+	invalid := base64.StdEncoding.EncodeToString([]byte("\x00invalid\x00password"))
+
+	// Corrupt credentials must return 501 syntax error.
+	cmdCode(t, tlsConn, "AUTH PLAIN", "334")
+	cmdCode(t, tlsConn, invalidBase64, "501")
+
+	cmdCode(t, tlsConn, "AUTH PLAIN", "334")
+	cmdCode(t, tlsConn, missingNUL, "501")
+
+	// Invalid credentials must return 535 authentication credentials invalid.
+	cmdCode(t, tlsConn, "AUTH PLAIN", "334")
+	cmdCode(t, tlsConn, invalid, "535")
+
+	// Valid credentials must return 235 authentication succeeded.
+	cmdCode(t, tlsConn, "AUTH PLAIN", "334")
+	cmdCode(t, tlsConn, valid, "235")
+
+	// AUTH after prior successful AUTH must return 503 bad sequence.
+	cmdCode(t, tlsConn, "AUTH LOGIN", "503")
+	cmdCode(t, tlsConn, "AUTH PLAIN", "503")
+	cmdCode(t, tlsConn, "AUTH CRAM-MD5", "503")
+
+	cmdCode(t, tlsConn, "QUIT", "221")
+	tlsConn.Close()
+}
+
+func TestCmdAUTHPLAINFast(t *testing.T) {
+	cert := makeCertificate(t)
+	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler}
+	conn := newPipeConn(t, server)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+
+	// AUTH PLAIN without TLS in use must return 504 unrecognised type.
+	cmdCode(t, conn, "AUTH PLAIN", "504")
+
+	// Upgrade to TLS.
+	cmdCode(t, conn, "STARTTLS", "220")
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	err := tlsConn.Handshake()
+	if err != nil {
+		t.Errorf("Failed to perform TLS handshake")
+	}
+	cmdCode(t, tlsConn, "EHLO host.example.com", "250")
+
+	// AUTH PLAIN with TLS in use can proceed.
+	// RFC 2595 specifies:
+	// The client sends the authorization identity (identity to
+	// login as), followed by a US-ASCII NUL character, followed by the
+	// authentication identity (identity whose password will be used),
+	// followed by a US-ASCII NUL character, followed by the clear-text
+	// password.  The client may leave the authorization identity empty to
+	// indicate that it is the same as the authentication identity.
+
+	// Fast PLAIN authentication process:
+	// Client sends "AUTH PLAIN " plus Base64-encoded string: identity\0username\0password
+	invalidBase64 := "==" // Invalid Base64 string.
+	missingNUL := base64.StdEncoding.EncodeToString([]byte("valid\x00password"))
+	valid := base64.StdEncoding.EncodeToString([]byte("identity\x00valid\x00password"))
+	invalid := base64.StdEncoding.EncodeToString([]byte("identity\x00invalid\x00password"))
+
+	// Corrupt credentials must return 501 syntax error.
+	cmdCode(t, tlsConn, "AUTH PLAIN "+invalidBase64, "501")
+	cmdCode(t, tlsConn, "AUTH PLAIN "+missingNUL, "501")
+
+	// Invalid credentials must return 535 authentication credentials invalid.
+	cmdCode(t, tlsConn, "AUTH PLAIN "+invalid, "535")
+
+	// Valid credentials must return 235 authentication succeeded.
+	cmdCode(t, tlsConn, "AUTH PLAIN "+valid, "235")
+
+	// AUTH after prior successful AUTH must return 503 bad sequence.
+	cmdCode(t, tlsConn, "AUTH LOGIN", "503")
+	cmdCode(t, tlsConn, "AUTH PLAIN", "503")
+	cmdCode(t, tlsConn, "AUTH CRAM-MD5", "503")
+
+	cmdCode(t, tlsConn, "QUIT", "221")
+	tlsConn.Close()
+}
+
+func TestCmdAUTHPLAINFastAndEmpty(t *testing.T) {
+	cert := makeCertificate(t)
+	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler}
+	conn := newPipeConn(t, server)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+
+	// AUTH PLAIN without TLS in use must return 504 unrecognised type.
+	cmdCode(t, conn, "AUTH PLAIN", "504")
+
+	// Upgrade to TLS.
+	cmdCode(t, conn, "STARTTLS", "220")
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	err := tlsConn.Handshake()
+	if err != nil {
+		t.Errorf("Failed to perform TLS handshake")
+	}
+	cmdCode(t, tlsConn, "EHLO host.example.com", "250")
+
+	// AUTH PLAIN with TLS in use can proceed.
+	// RFC 2595 specifies:
+	// The client sends the authorization identity (identity to
+	// login as), followed by a US-ASCII NUL character, followed by the
+	// authentication identity (identity whose password will be used),
+	// followed by a US-ASCII NUL character, followed by the clear-text
+	// password.  The client may leave the authorization identity empty to
+	// indicate that it is the same as the authentication identity.
+
+	// Fast PLAIN authentication process with empty authorisation identity:
+	// Client sends "AUTH PLAIN " plus Base64-encoded string: \0username\0password
+	invalidBase64 := "==" // Invalid Base64 string.
+	missingNUL := base64.StdEncoding.EncodeToString([]byte("valid\x00password"))
+	valid := base64.StdEncoding.EncodeToString([]byte("\x00valid\x00password"))
+	invalid := base64.StdEncoding.EncodeToString([]byte("\x00invalid\x00password"))
+
+	// Corrupt credentials must return 501 syntax error.
+	cmdCode(t, tlsConn, "AUTH PLAIN "+invalidBase64, "501")
+	cmdCode(t, tlsConn, "AUTH PLAIN "+missingNUL, "501")
+
+	// Invalid credentials must return 535 authentication credentials invalid.
+	cmdCode(t, tlsConn, "AUTH PLAIN "+invalid, "535")
+
+	// Valid credentials must return 235 authentication succeeded.
+	cmdCode(t, tlsConn, "AUTH PLAIN "+valid, "235")
+
+	// AUTH after prior successful AUTH must return 503 bad sequence.
+	cmdCode(t, tlsConn, "AUTH LOGIN", "503")
+	cmdCode(t, tlsConn, "AUTH PLAIN", "503")
+	cmdCode(t, tlsConn, "AUTH CRAM-MD5", "503")
+
+	cmdCode(t, tlsConn, "QUIT", "221")
+	tlsConn.Close()
+}
+
+// makeCRAMMD5Response is a helper function to create the CRAM-MD5 hash.
+func makeCRAMMD5Response(challenge string, username string, secret string) (string, error) {
+	decoded, err := base64.StdEncoding.DecodeString(challenge)
+	if err != nil {
+		return "", err
+	}
+	hash := hmac.New(md5.New, []byte(secret))
+	hash.Write(decoded)
+	buffer := make([]byte, 0, hash.Size())
+	response := fmt.Sprintf("%s %x", username, hash.Sum(buffer))
+	return base64.StdEncoding.EncodeToString([]byte(response)), nil
+}
+
+func TestCmdAUTHCRAMMD5(t *testing.T) {
+	server := &Server{AuthHandler: authHandler}
+	conn := newPipeConn(t, server)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+
+	// AUTH CRAM-MD5 without TLS in use can proceed.
+	// RFC 2195 specifies:
+	// The challenge format is that of a Message-ID email header value.
+	// Challenge format: '<' + random digits + '.' + timestamp in digits + '@' + fully-qualified server hostname + '>'
+	// Challenge example: <1896.697170952@postoffice.reston.mci.net>
+	// The response format consists of the username, a space and a digest.
+	// Digest calculation: MD5((secret XOR opad), MD5((secret XOR ipad), challenge))
+	// Response example: tim b913a602c7eda7a495b4e6e7334d3890
+
+	// CRAM-MD5 authentication process:
+	// Client sends "AUTH CRAM-MD5".
+	// Server sends "334 " plus Base64-encoded challenge.
+	// Client sends Base64-encoded response.
+	invalidBase64 := "==" // Invalid Base64 string.
+
+	// Corrupt credentials must return 501 syntax error.
+	cmdCode(t, conn, "AUTH CRAM-MD5", "334")
+	cmdCode(t, conn, invalidBase64, "501")
+
+	// Test valid credentials with missing space (causing a parse error).
+	line := cmdCode(t, conn, "AUTH CRAM-MD5", "334")
+	valid, _ := makeCRAMMD5Response(line[4:], "valid", "password")
+	buffer, _ := base64.StdEncoding.DecodeString(valid)
+	buffer = bytes.Replace(buffer, []byte(" "), []byte(""), 1)
+	missingSpace := base64.StdEncoding.EncodeToString(buffer)
+	cmdCode(t, conn, string(missingSpace), "501")
+
+	// Invalid credentials must return 535 authentication credentials invalid.
+	line = cmdCode(t, conn, "AUTH CRAM-MD5", "334")
+	invalid, err := makeCRAMMD5Response(line[4:], "invalid", "password")
+	if err != nil {
+		cmdCode(t, conn, "*", "501")
+	}
+	cmdCode(t, conn, invalid, "535")
+
+	// Valid credentials must return 235 authentication succeeded.
+	line = cmdCode(t, conn, "AUTH CRAM-MD5", "334")
+	valid, err = makeCRAMMD5Response(line[4:], "valid", "password")
+	if err != nil {
+		cmdCode(t, conn, "*", "501")
+	}
+	cmdCode(t, conn, valid, "235")
+
+	// AUTH after prior successful AUTH must return 503 bad sequence.
+	cmdCode(t, conn, "AUTH LOGIN", "503")
+	cmdCode(t, conn, "AUTH PLAIN", "503")
+	cmdCode(t, conn, "AUTH CRAM-MD5", "503")
+
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+}
+
+func TestCmdAUTHCRAMMD5WithTLS(t *testing.T) {
+	cert := makeCertificate(t)
+	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler}
+	conn := newPipeConn(t, server)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+
+	// Upgrade to TLS.
+	cmdCode(t, conn, "STARTTLS", "220")
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	err := tlsConn.Handshake()
+	if err != nil {
+		t.Errorf("Failed to perform TLS handshake")
+	}
+	cmdCode(t, tlsConn, "EHLO host.example.com", "250")
+
+	// AUTH CRAM-MD5 with TLS in use can proceed.
+	// RFC 2195 specifies:
+	// The challenge format is that of a Message-ID email header value.
+	// Challenge format: '<' + random digits + '.' + timestamp in digits + '@' + fully-qualified server hostname + '>'
+	// Challenge example: <1896.697170952@postoffice.reston.mci.net>
+	// The response format consists of the username, a space and a digest.
+	// Digest calculation: MD5((secret XOR opad), MD5((secret XOR ipad), challenge))
+	// Response example: tim b913a602c7eda7a495b4e6e7334d3890
+
+	// CRAM-MD5 authentication process:
+	// Client sends "AUTH CRAM-MD5".
+	// Server sends "334 " plus Base64-encoded challenge.
+	// Client sends Base64-encoded response.
+	invalidBase64 := "==" // Invalid Base64 string.
+
+	// Corrupt credentials must return 501 syntax error.
+	cmdCode(t, tlsConn, "AUTH CRAM-MD5", "334")
+	cmdCode(t, tlsConn, invalidBase64, "501")
+
+	// Test valid credentials with missing space (causing a parse error).
+	line := cmdCode(t, tlsConn, "AUTH CRAM-MD5", "334")
+	valid, _ := makeCRAMMD5Response(line[4:], "valid", "password")
+	buffer, _ := base64.StdEncoding.DecodeString(valid)
+	buffer = bytes.Replace(buffer, []byte(" "), []byte(""), 1)
+	missingSpace := base64.StdEncoding.EncodeToString(buffer)
+	cmdCode(t, tlsConn, string(missingSpace), "501")
+
+	// Invalid credentials must return 535 authentication credentials invalid.
+	line = cmdCode(t, tlsConn, "AUTH CRAM-MD5", "334")
+	invalid, err := makeCRAMMD5Response(line[4:], "invalid", "password")
+	if err != nil {
+		cmdCode(t, tlsConn, "*", "501")
+	}
+	cmdCode(t, tlsConn, invalid, "535")
+
+	// Valid credentials must return 235 authentication succeeded.
+	line = cmdCode(t, tlsConn, "AUTH CRAM-MD5", "334")
+	valid, err = makeCRAMMD5Response(line[4:], "valid", "password")
+	if err != nil {
+		cmdCode(t, tlsConn, "*", "501")
+	}
+	cmdCode(t, tlsConn, valid, "235")
+
+	// AUTH after prior successful AUTH must return 503 bad sequence.
+	cmdCode(t, tlsConn, "AUTH LOGIN", "503")
+	cmdCode(t, tlsConn, "AUTH PLAIN", "503")
+	cmdCode(t, tlsConn, "AUTH CRAM-MD5", "503")
+
+	cmdCode(t, tlsConn, "QUIT", "221")
+	tlsConn.Close()
+}
+
 // Benchmark the mail handling without the network stack introducing latency.
 func BenchmarkReceive(b *testing.B) {
+	server := &Server{} // Default server configuration.
 	clientConn, serverConn := net.Pipe()
-
-	server := &Server{}
 	session := server.newSession(serverConn)
 	go session.serve()
 
