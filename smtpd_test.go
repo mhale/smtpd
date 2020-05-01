@@ -131,10 +131,17 @@ func TestCmdMAIL(t *testing.T) {
 	cmdCode(t, conn, "MAIL", "501")
 	// MAIL with empty FROM arg should return 501 syntax error
 	cmdCode(t, conn, "MAIL FROM:", "501")
+	cmdCode(t, conn, "MAIL FROM: ", "501")
+	cmdCode(t, conn, "MAIL FROM:  ", "501")
 	// MAIL with DSN-style FROM arg should return 250 Ok
 	cmdCode(t, conn, "MAIL FROM:<>", "250")
 	// MAIL with valid FROM arg should return 250 Ok
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+
+	// MAIL with seemingly valid but noncompliant FROM arg (single space after the colon) should be tolerated and should return 250 Ok
+	cmdCode(t, conn, "MAIL FROM: <sender@example.com>", "250")
+	// MAIL with seemingly valid but noncompliant FROM arg (double space after the colon) should return 501 syntax error
+	cmdCode(t, conn, "MAIL FROM:  <sender@example.com>", "501")
 
 	// MAIL with valid SIZE parameter should return 250 Ok
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=1000", "250")
@@ -198,6 +205,8 @@ func TestCmdRCPT(t *testing.T) {
 
 	// RCPT with empty TO arg should return 501 syntax error
 	cmdCode(t, conn, "RCPT TO:", "501")
+	cmdCode(t, conn, "RCPT TO: ", "501")
+	cmdCode(t, conn, "RCPT TO:  ", "501")
 
 	// RCPT with valid TO arg should return 250 Ok
 	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
@@ -214,6 +223,16 @@ func TestCmdRCPT(t *testing.T) {
 	cmdCode(t, conn, "RSET", "250")
 	cmdCode(t, conn, "MAIL FROM:<>", "250")
 	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+
+	// RCPT with seemingly valid but noncompliant TO arg (single space after the colon) should be tolerated and should return 250 Ok
+	cmdCode(t, conn, "RSET", "250")
+	cmdCode(t, conn, "MAIL FROM:<>", "250")
+	cmdCode(t, conn, "RCPT TO: <recipient@example.com>", "250")
+
+	// RCPT with seemingly valid but noncompliant TO arg (double space after the colon) should return 501 syntax error
+	cmdCode(t, conn, "RSET", "250")
+	cmdCode(t, conn, "MAIL FROM:<>", "250")
+	cmdCode(t, conn, "RCPT TO:  <recipient@example.com>", "501")
 
 	cmdCode(t, conn, "QUIT", "221")
 	conn.Close()
