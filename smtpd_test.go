@@ -7,6 +7,7 @@ import (
 	"crypto/md5"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -284,6 +285,51 @@ func TestCmdDATAWithMaxSize(t *testing.T) {
 	// Clients should send either RSET or QUIT after receiving 552 (RFC 1870 section 6.2).
 	cmdCode(t, conn, "QUIT", "221")
 	conn.Close()
+}
+
+type mockHandler struct {
+	handlerCalled int
+}
+
+func (m *mockHandler) handler(err error) func(a net.Addr, f string, t []string, d []byte) error {
+	return func(a net.Addr, f string, t []string, d []byte) error {
+		m.handlerCalled++
+		return err
+	}
+}
+
+func TestCmdDATAWithHandler(t *testing.T) {
+	m := mockHandler{}
+	conn := newConn(t, &Server{Handler: m.handler(nil)})
+
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, conn, "DATA", "354")
+	cmdCode(t, conn, "Test message.\r\n.", "250")
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+
+	if m.handlerCalled != 1 {
+		t.Errorf("MailHandler called %d times, want one call", m.handlerCalled)
+	}
+}
+
+func TestCmdDATAWithHandlerError(t *testing.T) {
+	m := mockHandler{}
+	conn := newConn(t, &Server{Handler: m.handler(errors.New("Handler error"))})
+
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, conn, "DATA", "354")
+	cmdCode(t, conn, "Test message.\r\n.", "451")
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+
+	if m.handlerCalled != 1 {
+		t.Errorf("MailHandler called %d times, want one call", m.handlerCalled)
+	}
 }
 
 func TestCmdSTARTTLS(t *testing.T) {

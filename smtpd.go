@@ -29,7 +29,7 @@ var (
 )
 
 // Handler function called upon successful receipt of an email.
-type Handler func(remoteAddr net.Addr, from string, to []string, data []byte)
+type Handler func(remoteAddr net.Addr, from string, to []string, data []byte) error
 
 // HandlerRcpt function called on RCPT. Return accept status.
 type HandlerRcpt func(remoteAddr net.Addr, from string, to string) bool
@@ -379,12 +379,16 @@ loop:
 			buffer.Reset()
 			buffer.Write(s.makeHeaders(to))
 			buffer.Write(data)
-			s.writef("250 2.0.0 Ok: queued")
 
 			// Pass mail on to handler.
 			if s.srv.Handler != nil {
-				go s.srv.Handler(s.conn.RemoteAddr(), from, to, buffer.Bytes())
+				err := s.srv.Handler(s.conn.RemoteAddr(), from, to, buffer.Bytes())
+				if err != nil {
+					s.writef("451 4.3.5 Unable to process mail")
+					break
+				}
 			}
+			s.writef("250 2.0.0 Ok: queued")
 
 			// Reset for next mail.
 			from = ""
