@@ -365,7 +365,7 @@ loop:
 					if err.(net.Error).Timeout() {
 						s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
 					}
-					break loop
+					break
 				case maxSizeExceededError:
 					s.writef(err.Error())
 					continue
