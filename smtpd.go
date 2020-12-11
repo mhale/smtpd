@@ -230,7 +230,6 @@ func (s *session) serve() {
 	// Send banner.
 	s.writef("220 %s %s ESMTP Service ready", s.srv.Hostname, s.srv.Appname)
 
-loop:
 	for {
 		// Attempt to read a line from the socket.
 		// On timeout, send a timeout message and return from serve().
@@ -393,7 +392,7 @@ loop:
 			buffer.Reset()
 		case "QUIT":
 			s.writef("221 2.0.0 %s %s ESMTP Service closing transmission channel", s.srv.Hostname, s.srv.Appname)
-			break loop
+			break
 		case "RSET":
 			if s.srv.TLSConfig != nil && s.srv.TLSRequired && !s.tls {
 				s.writef("530 5.7.0 Must issue a STARTTLS command first")
@@ -502,7 +501,7 @@ loop:
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
-					break loop
+					break
 				}
 
 				s.writef(err.Error())
