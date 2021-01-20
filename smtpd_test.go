@@ -84,6 +84,8 @@ func TestCmdHELO(t *testing.T) {
 	// Verify that HELO resets the current transaction state like RSET.
 	// RFC 2821 section 4.1.4 says EHLO should cause a reset, so verify that HELO does it too.
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	// Some clients add a space after the :
+	cmdCode(t, conn, "MAIL FROM: <sender@example.com>", "250")
 	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
 	cmdCode(t, conn, "HELO host.example.com", "250")
 	cmdCode(t, conn, "DATA", "503")
