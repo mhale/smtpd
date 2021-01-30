@@ -1,3 +1,3 @@
-module github.com/prologic/smtpd
+module github.com/mhale/smtpd
 
 go 1.14
