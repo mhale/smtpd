@@ -3,6 +3,7 @@ package smtpd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/md5"
 	"crypto/tls"
@@ -1557,4 +1558,47 @@ func BenchmarkReceive(b *testing.B) {
 		fmt.Fprintf(clientConn, "%s\r\n", "QUIT")
 		_, _ = reader.ReadString('\n')
 	}
+}
+
+func TestCmdShutdown(t *testing.T) {
+
+	srv := &Server{}
+
+	conn := newConn(t, srv)
+
+	// Send HELO, expect greeting.
+	cmdCode(t, conn, "HELO host.example.com", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, conn, "HELO host.example.com", "250")
+	cmdCode(t, conn, "DATA", "503")
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(ctx); err != nil {
+			t.Errorf("Error shutting down server: %v\n", err)
+		}
+	}()
+
+	// give the shutdown time to act
+	time.Sleep(200 * time.Millisecond)
+
+	// shutdown will wait until the end of the session
+	cmdCode(t, conn, "HELO host.example.com", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+
+	// this will trigger the close
+	cmdCode(t, conn, "QUIT", "221")
+
+	// connection should now be closed
+	fmt.Fprintf(conn, "%s\r\n", "HELO host.example.com")
+	_, err := bufio.NewReader(conn).ReadString('\n')
+	if err != io.EOF {
+		t.Errorf("Expected connection to be closed\n")
+	}
+
+	conn.Close()
 }
