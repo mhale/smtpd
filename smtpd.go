@@ -4,6 +4,7 @@ package smtpd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -17,6 +18,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,6 +39,8 @@ type HandlerRcpt func(remoteAddr net.Addr, from string, to string) bool
 
 // AuthHandler function called when a login attempt is performed. Returns true if credentials are correct.
 type AuthHandler func(remoteAddr net.Addr, mechanism string, username []byte, password []byte, shared []byte) (bool, error)
+
+var ErrServerClosed = errors.New("Server has been closed")
 
 // ListenAndServe listens on the TCP network address addr
 // and then calls Serve with handler to handle requests
@@ -91,6 +96,11 @@ type Server struct {
 	TLSConfig    *tls.Config
 	TLSListener  bool // Listen for incoming TLS connections only (not recommended as it may reduce compatibility). Ignored if TLS is not configured.
 	TLSRequired  bool // Require TLS for every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207. Ignored if TLS is not configured.
+
+	inShutdown   int32 // server was closed or shutdown
+	openSessions int32 // count of open sessions
+	mu           sync.Mutex
+	shutdownChan chan struct{} // let the sessions know we are shutting down
 }
 
 // ConfigureTLS creates a TLS configuration from certificate and key files.
@@ -139,6 +149,10 @@ func (srv *Server) ConfigureTLSWithPassphrase(
 // calls Serve to handle requests on incoming connections.  If
 // srv.Addr is blank, ":25" is used.
 func (srv *Server) ListenAndServe() error {
+	if atomic.LoadInt32(&srv.inShutdown) != 0 {
+		return ErrServerClosed
+	}
+
 	if srv.Addr == "" {
 		srv.Addr = ":25"
 	}
@@ -169,8 +183,20 @@ func (srv *Server) ListenAndServe() error {
 
 // Serve creates a new SMTP session after a network connection is established.
 func (srv *Server) Serve(ln net.Listener) error {
+	if atomic.LoadInt32(&srv.inShutdown) != 0 {
+		return ErrServerClosed
+	}
+
 	defer ln.Close()
 	for {
+
+		// if we are shutting down, don't accept new connections
+		select {
+		case <-srv.getShutdownChan():
+			return ErrServerClosed
+		default:
+		}
+
 		conn, err := ln.Accept()
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
@@ -178,7 +204,9 @@ func (srv *Server) Serve(ln net.Listener) error {
 			}
 			return err
 		}
+
 		session := srv.newSession(conn)
+		atomic.AddInt32(&srv.openSessions, 1)
 		go session.serve()
 	}
 }
@@ -219,9 +247,71 @@ func (srv *Server) newSession(conn net.Conn) (s *session) {
 	return
 }
 
+func (srv *Server) getShutdownChan() <-chan struct{} {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.shutdownChan == nil {
+		srv.shutdownChan = make(chan struct{})
+	}
+
+	return srv.shutdownChan
+}
+
+func (srv *Server) closeShutdownChan() {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.shutdownChan == nil {
+		srv.shutdownChan = make(chan struct{})
+	}
+
+	select {
+	case <-srv.shutdownChan:
+	default:
+		close(srv.shutdownChan)
+	}
+}
+
+// Close - closes the connection without waiting
+func (srv *Server) Close() error {
+	atomic.StoreInt32(&srv.inShutdown, 1)
+	srv.closeShutdownChan()
+	return nil
+}
+
+// Shutdown - waits for current sessions to complete before closing
+func (srv *Server) Shutdown(ctx context.Context) error {
+	atomic.StoreInt32(&srv.inShutdown, 1)
+	srv.closeShutdownChan()
+
+	// wait for up to 30 seconds to allow the current sessions to
+	// end
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+
+	for i := 0; i < 300; i++ {
+
+		// wait for open sessions to close
+		if atomic.LoadInt32(&srv.openSessions) == 0 {
+			break
+		}
+
+		select {
+		case <-timer.C:
+			timer.Reset(100 * time.Millisecond)
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+	}
+
+	return nil
+}
+
 // Function called to handle connection requests.
 func (s *session) serve() {
+	defer atomic.AddInt32(&s.srv.openSessions, -1)
 	defer s.conn.Close()
+
 	var from string
 	var gotFrom bool
 	var to []string
@@ -242,6 +332,7 @@ loop:
 			}
 			break
 		}
+
 		verb, args := s.parseLine(line)
 
 		switch verb {
