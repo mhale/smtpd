@@ -215,4 +215,7 @@ The TLS and authentication support has also been manually tested with Go client 
 
 ## Licensing
 
-Some of the code in this package was copied or adapted from code found in [Brad Fitzpatrick's go-smtpd](https://github.com/bradfitz/go-smtpd). As such, those sections of code are subject to their original copyright and license. The remaining code is in the public domain.
+Some of the code in this package was copied or adapted from code found in
+[Brad Fitzpatrick's go-smtpd](https://github.com/bradfitz/go-smtpd) and from Go's
+`net.http` package. As such, those sections of code are subject to their original
+copyright and license. The remaining code is in the public domain.

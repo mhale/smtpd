@@ -97,8 +97,9 @@ type Server struct {
 	TLSListener  bool // Listen for incoming TLS connections only (not recommended as it may reduce compatibility). Ignored if TLS is not configured.
 	TLSRequired  bool // Require TLS for every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207. Ignored if TLS is not configured.
 
-	inShutdown   int32 // server was closed or shutdown
-	openSessions int32 // count of open sessions
+	listeners    map[*net.Listener]struct{} // references to listeners, so we can close it on close or shutdown
+	inShutdown   int32                      // server was closed or shutdown
+	openSessions int32                      // count of open sessions
 	mu           sync.Mutex
 	shutdownChan chan struct{} // let the sessions know we are shutting down
 }
@@ -183,11 +184,12 @@ func (srv *Server) ListenAndServe() error {
 
 // Serve creates a new SMTP session after a network connection is established.
 func (srv *Server) Serve(ln net.Listener) error {
-	if atomic.LoadInt32(&srv.inShutdown) != 0 {
+	if !srv.trackListener(&ln, true) {
 		return ErrServerClosed
 	}
 
-	defer ln.Close()
+	defer srv.trackListener(&ln, false)
+
 	for {
 
 		// if we are shutting down, don't accept new connections
@@ -199,6 +201,12 @@ func (srv *Server) Serve(ln net.Listener) error {
 
 		conn, err := ln.Accept()
 		if err != nil {
+			select {
+			case <-srv.getShutdownChan():
+				return ErrServerClosed
+			default:
+			}
+
 			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
 				continue
 			}
@@ -209,6 +217,34 @@ func (srv *Server) Serve(ln net.Listener) error {
 		atomic.AddInt32(&srv.openSessions, 1)
 		go session.serve()
 	}
+}
+
+// trackListener adds or removes a net.Listener to the set of tracked
+// listeners.
+//
+// We store a pointer to interface in the map set, in case the
+// net.Listener is not comparable. This is safe because we only call
+// trackListener via Serve and can track+defer untrack the same
+// pointer to local variable there. We never need to compare a
+// Listener from another caller.
+//
+// It reports whether the server is still up (not Shutdown or Closed).
+
+func (srv *Server) trackListener(ln *net.Listener, add bool) bool {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.listeners == nil {
+		srv.listeners = make(map[*net.Listener]struct{})
+	}
+	if add {
+		if atomic.LoadInt32(&srv.inShutdown) != 0 {
+			return false
+		}
+		srv.listeners[ln] = struct{}{}
+	} else {
+		delete(srv.listeners, ln)
+	}
+	return true
 }
 
 type session struct {
@@ -271,10 +307,21 @@ func (srv *Server) closeShutdownChan() {
 	}
 }
 
+func (srv *Server) closeListeners() error {
+	var err error
+	for ln := range srv.listeners {
+		if cerr := (*ln).Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	return err
+}
+
 // Close - closes the connection without waiting
 func (srv *Server) Close() error {
 	atomic.StoreInt32(&srv.inShutdown, 1)
 	srv.closeShutdownChan()
+	srv.closeListeners()
 	return nil
 }
 
@@ -282,6 +329,7 @@ func (srv *Server) Close() error {
 func (srv *Server) Shutdown(ctx context.Context) error {
 	atomic.StoreInt32(&srv.inShutdown, 1)
 	srv.closeShutdownChan()
+	srv.closeListeners()
 
 	// wait for up to 30 seconds to allow the current sessions to
 	// end
