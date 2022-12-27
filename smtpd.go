@@ -475,7 +475,12 @@ loop:
 			if s.srv.Handler != nil {
 				err := s.srv.Handler(s.conn.RemoteAddr(), from, to, buffer.Bytes())
 				if err != nil {
-					s.writef("451 4.3.5 Unable to process mail")
+					checkErrFormat := regexp.MustCompile(`^([2-5][0-9]{2})[\s\-](.+)$`)
+					if checkErrFormat.MatchString(err.Error()) {
+						s.writef(err.Error())
+					} else {
+						s.writef("451 4.3.5 Unable to process mail")
+					}
 					break
 				}
 			}
