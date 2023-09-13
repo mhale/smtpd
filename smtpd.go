@@ -713,7 +713,7 @@ func (s *session) readData() ([]byte, error) {
 func (s *session) makeHeaders(to []string) []byte {
 	var buffer bytes.Buffer
 	now := time.Now().Format("Mon, _2 Jan 2006 15:04:05 -0700 (MST)")
-	buffer.WriteString(fmt.Sprintf("Received: from %s (%s [%s])\r\n", s.remoteName, s.remoteHost, s.remoteIP))
+	buffer.WriteString(fmt.Sprintf("Received: from %s\r\n", s.remoteName))
 	buffer.WriteString(fmt.Sprintf("        by %s (%s) with SMTP\r\n", s.srv.Hostname, s.srv.Appname))
 	buffer.WriteString(fmt.Sprintf("        for <%s>; %s\r\n", to[0], now))
 	return buffer.Bytes()
