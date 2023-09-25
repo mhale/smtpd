@@ -101,6 +101,8 @@ type Server struct {
 	openSessions int32 // count of open sessions
 	mu           sync.Mutex
 	shutdownChan chan struct{} // let the sessions know we are shutting down
+
+	XClientAllowed []string // List of XCLIENT allowed IP addresses
 }
 
 // ConfigureTLS creates a TLS configuration from certificate and key files.
@@ -219,6 +221,10 @@ type session struct {
 	remoteIP      string // Remote IP address
 	remoteHost    string // Remote hostname according to reverse DNS lookup
 	remoteName    string // Remote hostname as supplied with EHLO
+	xClient       string // Information string as supplied with XCLIENT
+	xClientADDR   string // Information string as supplied with XCLIENT ADDR
+	xClientNAME   string // Information string as supplied with XCLIENT NAME
+	xClientTrust  bool   // Trust XCLIENT from current IP address
 	tls           bool
 	authenticated bool
 }
@@ -244,6 +250,11 @@ func (srv *Server) newSession(conn net.Conn) (s *session) {
 	// Set tls = true if TLS is already in use.
 	_, s.tls = s.conn.(*tls.Conn)
 
+	for _, checkIP := range srv.XClientAllowed {
+		if s.remoteIP == checkIP {
+			s.xClientTrust = true
+		}
+	}
 	return
 }
 
@@ -475,7 +486,12 @@ loop:
 			if s.srv.Handler != nil {
 				err := s.srv.Handler(s.conn.RemoteAddr(), from, to, buffer.Bytes())
 				if err != nil {
-					s.writef("451 4.3.5 Unable to process mail")
+					checkErrFormat := regexp.MustCompile(`^([2-5][0-9]{2})[\s\-](.+)$`)
+					if checkErrFormat.MatchString(err.Error()) {
+						s.writef(err.Error())
+					} else {
+						s.writef("451 4.3.5 Unable to process mail")
+					}
 					break
 				}
 			}
@@ -500,6 +516,36 @@ loop:
 			to = nil
 			buffer.Reset()
 		case "NOOP":
+			s.writef("250 2.0.0 Ok")
+		case "XCLIENT":
+			s.xClient = args
+			if s.xClientTrust {
+				xCArgs := strings.Split(args, " ")
+				for _, xCArg := range xCArgs {
+					xCParse := strings.Split(strings.TrimSpace(xCArg), "=")
+					if strings.ToUpper(xCParse[0]) == "ADDR" && (net.ParseIP(xCParse[1]) != nil) {
+						s.xClientADDR = xCParse[1]
+					}
+					if strings.ToUpper(xCParse[0]) == "NAME" && len(xCParse[1]) > 0 {
+						if xCParse[1] != "[UNAVAILABLE]" {
+							s.xClientNAME = xCParse[1]
+						}
+					}
+				}
+				if len(s.xClientADDR) > 7 {
+					s.remoteIP = s.xClientADDR
+					if len(s.xClientNAME) > 4 {
+						s.remoteHost = s.xClientNAME
+					} else {
+						names, err := net.LookupAddr(s.remoteIP)
+						if err == nil && len(names) > 0 {
+							s.remoteHost = names[0]
+						} else {
+							s.remoteHost = "unknown"
+						}
+					}
+				}
+			}
 			s.writef("250 2.0.0 Ok")
 		case "HELP", "VRFY", "EXPN":
 			// See RFC 5321 section 4.2.4 for usage of 500 & 502 response codes.
