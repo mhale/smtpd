@@ -81,21 +81,22 @@ type LogFunc func(remoteIP, verb, line string)
 
 // Server is an SMTP server.
 type Server struct {
-	Addr         string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
-	Appname      string
-	AuthHandler  AuthHandler
-	AuthMechs    map[string]bool // Override list of allowed authentication mechanisms. Currently supported: LOGIN, PLAIN, CRAM-MD5. Enabling LOGIN and PLAIN will reduce RFC 4954 compliance.
-	AuthRequired bool            // Require authentication for every command except AUTH, EHLO, HELO, NOOP, RSET or QUIT as per RFC 4954. Ignored if AuthHandler is not configured.
-	Handler      Handler
-	HandlerRcpt  HandlerRcpt
-	Hostname     string
-	LogRead      LogFunc
-	LogWrite     LogFunc
-	MaxSize      int // Maximum message size allowed, in bytes
-	Timeout      time.Duration
-	TLSConfig    *tls.Config
-	TLSListener  bool // Listen for incoming TLS connections only (not recommended as it may reduce compatibility). Ignored if TLS is not configured.
-	TLSRequired  bool // Require TLS for every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207. Ignored if TLS is not configured.
+	Addr          string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
+	Appname       string
+	AuthHandler   AuthHandler
+	AuthMechs     map[string]bool // Override list of allowed authentication mechanisms. Currently supported: LOGIN, PLAIN, CRAM-MD5. Enabling LOGIN and PLAIN will reduce RFC 4954 compliance.
+	AuthRequired  bool            // Require authentication for every command except AUTH, EHLO, HELO, NOOP, RSET or QUIT as per RFC 4954. Ignored if AuthHandler is not configured.
+	Handler       Handler
+	HandlerRcpt   HandlerRcpt
+	Hostname      string
+	LogRead       LogFunc
+	LogWrite      LogFunc
+	MaxSize       int // Maximum message size allowed, in bytes
+	MaxRecipients int // Maximum number of recipients, defaults to 100.
+	Timeout       time.Duration
+	TLSConfig     *tls.Config
+	TLSListener   bool // Listen for incoming TLS connections only (not recommended as it may reduce compatibility). Ignored if TLS is not configured.
+	TLSRequired   bool // Require TLS for every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207. Ignored if TLS is not configured.
 
 	inShutdown   int32 // server was closed or shutdown
 	openSessions int32 // count of open sessions
@@ -424,8 +425,11 @@ loop:
 			if match == nil {
 				s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid TO parameter)")
 			} else {
-				// RFC 5321 specifies 100 minimum recipients
-				if len(to) == 100 {
+				// RFC 5321 specifies support for minimum of 100 recipients is required.
+				if s.srv.MaxRecipients == 0 {
+					s.srv.MaxRecipients = 100
+				}
+				if len(to) == s.srv.MaxRecipients {
 					s.writef("452 4.5.3 Too many recipients")
 				} else {
 					accept := true
