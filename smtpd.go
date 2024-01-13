@@ -81,22 +81,23 @@ type LogFunc func(remoteIP, verb, line string)
 
 // Server is an SMTP server.
 type Server struct {
-	Addr          string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
-	Appname       string
-	AuthHandler   AuthHandler
-	AuthMechs     map[string]bool // Override list of allowed authentication mechanisms. Currently supported: LOGIN, PLAIN, CRAM-MD5. Enabling LOGIN and PLAIN will reduce RFC 4954 compliance.
-	AuthRequired  bool            // Require authentication for every command except AUTH, EHLO, HELO, NOOP, RSET or QUIT as per RFC 4954. Ignored if AuthHandler is not configured.
-	Handler       Handler
-	HandlerRcpt   HandlerRcpt
-	Hostname      string
-	LogRead       LogFunc
-	LogWrite      LogFunc
-	MaxSize       int // Maximum message size allowed, in bytes
-	MaxRecipients int // Maximum number of recipients, defaults to 100.
-	Timeout       time.Duration
-	TLSConfig     *tls.Config
-	TLSListener   bool // Listen for incoming TLS connections only (not recommended as it may reduce compatibility). Ignored if TLS is not configured.
-	TLSRequired   bool // Require TLS for every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207. Ignored if TLS is not configured.
+	Addr              string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
+	Appname           string
+	AuthHandler       AuthHandler
+	AuthMechs         map[string]bool // Override list of allowed authentication mechanisms. Currently supported: LOGIN, PLAIN, CRAM-MD5. Enabling LOGIN and PLAIN will reduce RFC 4954 compliance.
+	AuthRequired      bool            // Require authentication for every command except AUTH, EHLO, HELO, NOOP, RSET or QUIT as per RFC 4954. Ignored if AuthHandler is not configured.
+	DisableReverseDNS bool            // Disable reverse DNS lookups, enforces "unknown" hostname
+	Handler           Handler
+	HandlerRcpt       HandlerRcpt
+	Hostname          string
+	LogRead           LogFunc
+	LogWrite          LogFunc
+	MaxSize           int // Maximum message size allowed, in bytes
+	MaxRecipients     int // Maximum number of recipients, defaults to 100.
+	Timeout           time.Duration
+	TLSConfig         *tls.Config
+	TLSListener       bool // Listen for incoming TLS connections only (not recommended as it may reduce compatibility). Ignored if TLS is not configured.
+	TLSRequired       bool // Require TLS for every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207. Ignored if TLS is not configured.
 
 	inShutdown   int32 // server was closed or shutdown
 	openSessions int32 // count of open sessions
@@ -241,9 +242,13 @@ func (srv *Server) newSession(conn net.Conn) (s *session) {
 
 	// Get remote end info for the Received header.
 	s.remoteIP, _, _ = net.SplitHostPort(s.conn.RemoteAddr().String())
-	names, err := net.LookupAddr(s.remoteIP)
-	if err == nil && len(names) > 0 {
-		s.remoteHost = names[0]
+	if !s.srv.DisableReverseDNS {
+		names, err := net.LookupAddr(s.remoteIP)
+		if err == nil && len(names) > 0 {
+			s.remoteHost = names[0]
+		} else {
+			s.remoteHost = "unknown"
+		}
 	} else {
 		s.remoteHost = "unknown"
 	}
