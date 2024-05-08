@@ -32,7 +32,12 @@ var (
 )
 
 // Handler function called upon successful receipt of an email.
+// Results in a "250 2.0.0 Ok: queued" response.
 type Handler func(remoteAddr net.Addr, from string, to []string, data []byte) error
+
+// MsgIDHandler function called upon successful receipt of an email. Returns a message ID.
+// Results in a "250 2.0.0 Ok: queued as <message-id>" response.
+type MsgIDHandler func(remoteAddr net.Addr, from string, to []string, data []byte) (string, error)
 
 // HandlerRcpt function called on RCPT. Return accept status.
 type HandlerRcpt func(remoteAddr net.Addr, from string, to string) bool
@@ -94,6 +99,7 @@ type Server struct {
 	LogWrite          LogFunc
 	MaxSize           int // Maximum message size allowed, in bytes
 	MaxRecipients     int // Maximum number of recipients, defaults to 100.
+	MsgIDHandler      MsgIDHandler
 	Timeout           time.Duration
 	TLSConfig         *tls.Config
 	TLSListener       bool // Listen for incoming TLS connections only (not recommended as it may reduce compatibility). Ignored if TLS is not configured.
@@ -503,8 +509,27 @@ loop:
 					}
 					break
 				}
+				s.writef("250 2.0.0 Ok: queued")
+			} else if s.srv.MsgIDHandler != nil {
+				msgID, err := s.srv.MsgIDHandler(s.conn.RemoteAddr(), from, to, buffer.Bytes())
+				if err != nil {
+					checkErrFormat := regexp.MustCompile(`^([2-5][0-9]{2})[\s\-](.+)$`)
+					if checkErrFormat.MatchString(err.Error()) {
+						s.writef(err.Error())
+					} else {
+						s.writef("451 4.3.5 Unable to process mail")
+					}
+					break
+				}
+
+				if msgID != "" {
+					s.writef("250 2.0.0 Ok: queued as " + msgID)
+				} else {
+					s.writef("250 2.0.0 Ok: queued")
+				}
+			} else {
+				s.writef("250 2.0.0 Ok: queued")
 			}
-			s.writef("250 2.0.0 Ok: queued")
 
 			// Reset for next mail.
 			from = ""
