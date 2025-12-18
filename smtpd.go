@@ -197,20 +197,19 @@ func (srv *Server) Serve(ln net.Listener) error {
 		return ErrServerClosed
 	}
 
-	defer ln.Close()
+	go func() {
+		<-srv.getShutdownChan()
+		ln.Close()
+	}()
+
 	for {
-
-		// if we are shutting down, don't accept new connections
-		select {
-		case <-srv.getShutdownChan():
-			return ErrServerClosed
-		default:
-		}
-
 		conn, err := ln.Accept()
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
 				continue
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return ErrServerClosed
 			}
 			return err
 		}

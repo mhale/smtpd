@@ -1602,3 +1602,35 @@ func TestCmdShutdown(t *testing.T) {
 
 	conn.Close()
 }
+
+func TestGracefulShutdown(t *testing.T) {
+	// Run server
+	srv := &Server{Addr: ":1234"}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		err := srv.ListenAndServe()
+		if err != nil && !errors.Is(err, ErrServerClosed) {
+			t.Errorf("Error serving: %v\n", err)
+		}
+	}()
+
+	// Shutdown server
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Errorf("Error shutting down server: %v\n", err)
+	}
+
+	// Verify that port is no longer listening
+	_, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		t.Errorf("Port is still listening: %v\n", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Errorf("Timeout waiting for server to finish")
+	}
+}
